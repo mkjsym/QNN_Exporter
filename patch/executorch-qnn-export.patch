@@ -1,0 +1,2363 @@
+diff --git a/examples/models/qwen3/config/8b_config.json b/examples/models/qwen3/config/8b_config.json
+new file mode 100644
+index 0000000..71baa3d
+--- /dev/null
++++ b/examples/models/qwen3/config/8b_config.json
+@@ -0,0 +1,17 @@
++{
++  "dim": 4096,
++  "ffn_dim_multiplier": 1,
++  "hidden_dim": 12288,
++  "n_heads": 32,
++  "head_dim": 128,
++  "n_kv_heads": 8,
++  "n_layers": 36,
++  "norm_eps": 1e-06,
++  "rope_theta": 1000000.0,
++  "use_scaled_rope": false,
++  "vocab_size": 151936,
++  "use_hf_rope": true,
++  "attention_qkv_bias": false,
++  "use_qk_norm": true,
++  "qk_norm_before_rope": true
++}
+diff --git a/examples/models/qwen3_dflash/__init__.py b/examples/models/qwen3_dflash/__init__.py
+new file mode 100644
+index 0000000..acaf67d
+--- /dev/null
++++ b/examples/models/qwen3_dflash/__init__.py
+@@ -0,0 +1,3 @@
++from .convert_weights import convert_weights
++
++__all__ = ["convert_weights"]
+diff --git a/examples/models/qwen3_dflash/config/4b_dflash_config.json b/examples/models/qwen3_dflash/config/4b_dflash_config.json
+new file mode 100644
+index 0000000..e5ec607
+--- /dev/null
++++ b/examples/models/qwen3_dflash/config/4b_dflash_config.json
+@@ -0,0 +1,17 @@
++{
++  "dim": 2560,
++  "ffn_dim_multiplier": 1,
++  "hidden_dim": 9728,
++  "n_heads": 32,
++  "head_dim": 128,
++  "n_kv_heads": 8,
++  "n_layers": 5,
++  "norm_eps": 1e-06,
++  "rope_theta": 1000000,
++  "use_scaled_rope": false,
++  "vocab_size": 151936,
++  "use_hf_rope": true,
++  "attention_qkv_bias": false,
++  "use_qk_norm": true,
++  "qk_norm_before_rope": true
++}
+diff --git a/examples/models/qwen3_dflash/config/8b_dflash_config.json b/examples/models/qwen3_dflash/config/8b_dflash_config.json
+new file mode 100644
+index 0000000..47b5e4f
+--- /dev/null
++++ b/examples/models/qwen3_dflash/config/8b_dflash_config.json
+@@ -0,0 +1,17 @@
++{
++  "dim": 4096,
++  "ffn_dim_multiplier": 1,
++  "hidden_dim": 12288,
++  "n_heads": 32,
++  "head_dim": 128,
++  "n_kv_heads": 8,
++  "n_layers": 5,
++  "norm_eps": 1e-06,
++  "rope_theta": 1000000,
++  "use_scaled_rope": false,
++  "vocab_size": 151936,
++  "use_hf_rope": true,
++  "attention_qkv_bias": false,
++  "use_qk_norm": true,
++  "qk_norm_before_rope": true
++}
+diff --git a/examples/models/qwen3_dflash/convert_weights.py b/examples/models/qwen3_dflash/convert_weights.py
+new file mode 100644
+index 0000000..c4be875
+--- /dev/null
++++ b/examples/models/qwen3_dflash/convert_weights.py
+@@ -0,0 +1,101 @@
++"""Convert a DFlash draft checkpoint to the static-decoder parameter naming.
++
++A DFlash draft is a 5-layer Qwen3 decoder plus two tensors an ordinary decoder does not have:
++`fc`, which projects the concatenated target hidden states down to one hidden width, and
++`hidden_norm`, which normalizes that projection. Both keep their names -- DFlashDraftModel declares
++them under exactly these attributes.
++
++The checkpoint also ships `embed_tokens.weight` and `lm_head.weight`, which the reference draft
++model does not own (it takes the block embedding ready-made and returns un-projected hidden states).
++They are kept here because the fused export does the embedding lookup and the output projection
++inside the graph -- doing either on the host would mean a second device round-trip per step, which
++is the cost this whole exercise exists to remove. The embedding is bit-identical to the target's, so
++nothing is lost by carrying the draft's copy.
++"""
++
++import argparse
++import os
++from typing import Dict
++
++import torch
++
++from executorch.examples.models.qwen3.convert_weights import load_checkpoint
++
++_DFLASH_FROM_HF = {
++    "embed_tokens.weight": "tok_embeddings.weight",
++    "lm_head.weight": "output.weight",
++    "norm.weight": "norm.weight",
++    "hidden_norm.weight": "hidden_norm.weight",
++}
++
++_DFLASH_LAYER_FROM_HF = {
++    "self_attn.q_proj.weight": "attention.wq.weight",
++    "self_attn.k_proj.weight": "attention.wk.weight",
++    "self_attn.v_proj.weight": "attention.wv.weight",
++    "self_attn.o_proj.weight": "attention.wo.weight",
++    "self_attn.q_norm.weight": "attention.q_norm_fn.weight",
++    "self_attn.k_norm.weight": "attention.k_norm_fn.weight",
++    "input_layernorm.weight": "attention_norm.weight",
++    "post_attention_layernorm.weight": "ffn_norm.weight",
++    # Qwen3 applies the activation on gate_proj, so the static decoder's w1/w3 are swapped
++    # relative to the usual w1=up convention -- same swap the Qwen3 converter documents.
++    "mlp.gate_proj.weight": "feed_forward.w1.weight",
++    "mlp.down_proj.weight": "feed_forward.w2.weight",
++    "mlp.up_proj.weight": "feed_forward.w3.weight",
++}
++
++
++# Heads a DSpark checkpoint carries that never enter the graph. DSpark is a DFlash draft plus a
++# Markov head, which re-scores candidates per concrete parent, and a confidence head, which gates
++# proposal length -- both are consumed on the host from the draft GGUF, so the exported graph must
++# not carry them. Dropping them here is what lets one converter serve both drafts.
++_HOST_SIDE_PREFIXES = ("markov_head.", "confidence_head.")
++
++
++def dflash_hf_to_meta(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
++    out = {}
++    for key, value in state_dict.items():
++        if key.startswith(_HOST_SIDE_PREFIXES):
++            continue
++        if key == "fc.weight":
++            # Split the projection into one block per target layer. The model sums the blocks
++            # instead of projecting a concatenation, so that each target layer keeps its own
++            # activation scale -- see dflash_draft.py for why that matters.
++            dim = value.shape[0]
++            n = value.shape[1] // dim
++            assert value.shape[1] == dim * n, f"fc is not a whole number of blocks: {value.shape}"
++            for i in range(n):
++                out[f"fc.{i}.weight"] = value[:, i * dim:(i + 1) * dim].contiguous()
++            continue
++        if key in _DFLASH_FROM_HF:
++            out[_DFLASH_FROM_HF[key]] = value
++            continue
++        if key.startswith("layers."):
++            idx, rest = key.split(".", 2)[1], key.split(".", 2)[2]
++            if rest in _DFLASH_LAYER_FROM_HF:
++                out[f"layers.{idx}.{_DFLASH_LAYER_FROM_HF[rest]}"] = value
++                continue
++        raise KeyError(f"unmapped DFlash tensor: {key}")
++    return out
++
++
++def convert_weights(input_dir: str, output_file: str) -> None:
++    print("Loading checkpoint...")
++    sd = load_checkpoint(input_dir)
++    print("Converting checkpoint...")
++    sd = dflash_hf_to_meta(sd)
++    print(f"Saving checkpoint to {output_file}...")
++    torch.save(sd, output_file)
++    print("Done.")
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Convert a DFlash draft checkpoint.")
++    parser.add_argument("input_dir", type=str, help="Directory holding the DFlash checkpoint.")
++    parser.add_argument("output", type=str, help="Path to the output checkpoint.")
++    args = parser.parse_args()
++    convert_weights(args.input_dir, args.output)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/qualcomm/oss_scripts/llama/__init__.py b/examples/qualcomm/oss_scripts/llama/__init__.py
+index 4e2b051..8b0759c 100644
+--- a/examples/qualcomm/oss_scripts/llama/__init__.py
++++ b/examples/qualcomm/oss_scripts/llama/__init__.py
+@@ -9,7 +9,11 @@ from abc import ABC
+ from dataclasses import dataclass
+ from enum import Enum
+ from functools import partial
+-from typing import Callable, Dict, Optional, Sequence, Type, Union
++from typing import Callable, Dict, List, Optional, Sequence, Type, Union
++
++from executorch.examples.models.qwen3_dflash import (
++    convert_weights as convert_dflash_weights,
++)
+ 
+ from executorch.examples.models.codegen import (
+     convert_weights as convert_codegen_weights,
+@@ -87,6 +91,15 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
+     Qwen2_5_1_5BQuantRecipe,
+     Qwen3_0_6BQuantRecipe,
+     Qwen3_1_7BQuantRecipe,
++    Qwen3_16a8wQuantRecipe,
++    Qwen3_KV16HistQuantRecipe,
++    Qwen3_KV16QuantRecipe,
++    Qwen3_4B_SqnrQuantRecipe,
++    Qwen3_4BQuantRecipe,
++    Qwen3_8BQuantRecipe,
++    Qwen3_DFlashDraftQuantRecipe,
++    Qwen3_DFlashDraftW4A16QuantRecipe,
++    Qwen3_DFlashDraftW4A8QuantRecipe,
+     Smollm2QATQuantRecipe,
+     Smollm2QuantRecipe,
+     Smollm3QuantRecipe,
+@@ -99,7 +112,16 @@ from tabulate import tabulate
+ BASE_DIR = os.path.dirname(__file__)
+ 
+ 
++from executorch.examples.qualcomm.oss_scripts.llama.model.dflash_draft import (  # noqa: E402
++    DFlashDraftModel,
++)
++
+ LLM_VARIANT_ARCHS: Dict[str, LlamaModel] = {
++    "qwen3-4b-dflash": DFlashDraftModel,
++    "qwen3-4b-dflash-w4": DFlashDraftModel,
++    "qwen3-4b-dflash-w4a8": DFlashDraftModel,
++    "qwen3-4b-dspark": DFlashDraftModel,
++    "qwen3-8b-dflash": DFlashDraftModel,
+     "gemma3-1b": MultiScopeAwareLlamaModel,
+     "granite_speech_3_3-2b": LlamaModelWithoutEmbedding,
+     "smolvlm_500m_instruct": LlamaModelWithoutEmbedding,
+@@ -121,6 +143,10 @@ class LLMModelConfig(ABC):
+     transform_weight: Set to true to change Hugging Face weight to improve the performance of RoPE in HTP backend.
+     instruct_model: True if the model uses chat templates. Check Hugging Face model card to ensure the model uses chat templates.
+     num_sharding: Specify the number of splits by inserting the fallback custom op. The graph will be split evenly by layers.
++    shard_layers: Optional explicit list of layers that start a new partition, overriding the even
++                  split implied by num_sharding. Set this when the boundaries must land on specific
++                  layers (e.g. a speculative-decoding draft that consumes particular target hidden
++                  states); leave None otherwise. num_sharding must still be > 1 to enable sharding.
+     masked_softmax: The MaskedSoftmax feature is designed to optimize the LLMs accuracy and performance executed on HTP backend.
+                     MaskedSoftmax is used to replace the Softmax(Add(In, Mask)) structure in attention block in LLMs during backend optimization.
+                     For more details, please refer to QNN documents. Note that it is only supported starting from QNN 2.35.
+@@ -149,6 +175,12 @@ class LLMModelConfig(ABC):
+     r3: bool
+     quant_recipe: StaticLLMQuantRecipe
+     qat_recipe: Optional[Type[StaticLLMQuantRecipe]] = None
++    shard_layers: Optional[List[int]] = None
++    # speculative-decoding draft heads only
++    n_inject: Optional[int] = None
++    n_target_layers: Optional[int] = None
++    mask_token_id: Optional[int] = None
++    tokenizer_repo_id: Optional[str] = None
+ 
+     def __str__(self):  # noqa: C901
+         """
+@@ -173,7 +205,9 @@ class LLMModelConfig(ABC):
+             elif isinstance(v, Enum):
+                 return f"{v.__class__.__name__}.{v.name}"
+             elif isinstance(v, (tuple, list)):
+-                return "(" + ", ".join(format_value(i) for i in v) + ")"
++                # str() the elements: format_value returns ints/floats unconverted, so a list of
++                # numbers (e.g. shard_layers) would fail the join.
++                return "(" + ", ".join(str(format_value(i)) for i in v) + ")"
+             elif isinstance(v, (str, int, float, bool)):
+                 return v
+             else:
+@@ -532,6 +566,385 @@ class Qwen3_1_7B(LLMModelConfig):
+     quant_recipe = Qwen3_1_7BQuantRecipe
+ 
+ 
++@register_llm_model("qwen3-4b")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B(LLMModelConfig):
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    # 36 layers split 2/8/8/8/8/2 rather than evenly. DFlash's draft reads the target's
++    # hidden_states[2,10,18,26,34] (build_target_layer_ids(36,5)=[1,9,17,25,33] plus the +1 offset
++    # in extract_context_feature), i.e. the outputs of layers 1/9/17/25/33. Starting a partition at
++    # each of 2/10/18/26/34 makes exactly those tensors the inter-shard hidden states, so the
++    # runner can read them without adding graph outputs.
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_4BQuantRecipe
++
++
++@register_llm_model("qwen3-4b-w8")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_W8(LLMModelConfig):
++    """Qwen3-4B with 8-bit weights. Identical to qwen3-4b except for the quantization recipe.
++
++    Kept as its own entry rather than a flag so both builds can exist side by side and be compared
++    on acceptance length, which is what decides whether the extra size is worth it. (Subclassing
++    Qwen3_4B does not work: the registry's dataclasses are init=False.)
++    """
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_16a8wQuantRecipe
++
++
++@register_llm_model("qwen3-4b-kv16")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_KV16(LLMModelConfig):
++    """Qwen3-4B, 16a4w weights/activations but a 16-bit KV cache. See Qwen3_KV16QuantRecipe."""
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_KV16QuantRecipe
++
++
++@register_llm_model("qwen3-4b-lc")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_LongCalib(LLMModelConfig):
++    """Qwen3-4B, identical to Qwen3_4B -- the difference is the calibration data passed on the CLI.
++
++    Registered separately only so the artifact and the context dir do not collide with the
++    short-calibration build it is being compared against.
++    """
++
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_4BQuantRecipe
++
++
++@register_llm_model("qwen3-4b-r2")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_R2(LLMModelConfig):
++    """Qwen3-4B with the SpinQuant R2 rotation on V/O. Otherwise identical to Qwen3_4B.
++
++    R2 is exactly rotation-invariant at the block output, so this changes only how V and O
++    are distributed going into the quantizer -- aimed at wv and wo, the two groups the SQNR
++    analysis flags as worst once the depth confound is removed.
++    """
++
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = True
++    r3 = True
++    quant_recipe = Qwen3_4BQuantRecipe
++
++
++@register_llm_model("qwen3-4b-sqnr")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_Sqnr(LLMModelConfig):
++    """Qwen3-4B with the SQNR analyzer's mixed-precision upgrades. See Qwen3_4B_SqnrQuantRecipe."""
++
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_4B_SqnrQuantRecipe
++
++
++@register_llm_model("qwen3-4b-kv16-mse")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_KV16_MSE(LLMModelConfig):
++    """qwen3-4b-kv16 plus sequential MSE scale search.
++
++    Everything so far has quantized weights by round-to-nearest with min/max scales, which lets a
++    few outliers set the scale and spends most of the range on values that are not there. SeqMSE
++    searches per-parameter scales that minimise the MSE of the layer's output instead, so it costs
++    export time only -- no change to model size or inference speed. 50 candidates is what the
++    upstream Qwen3-0.6B config uses.
++    """
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 50
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_KV16QuantRecipe
++
++
++@register_llm_model("qwen3-4b-kv16-hist")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_KV16_Hist(LLMModelConfig):
++    """qwen3-4b-kv16 with histogram activation ranges. See Qwen3_KV16HistQuantRecipe."""
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_KV16HistQuantRecipe
++
++
++@register_llm_model("qwen3-8b")
++@dataclass(init=False, frozen=True)
++class Qwen3_8B(LLMModelConfig):
++    repo_id: str = "Qwen/Qwen3-8B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/8b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    # Same 36 layers and the same DFlash capture points as 4B, so the same uneven split applies.
++    # num_sharding is kept > 1 only to enable sharding; shard_layers decides the actual boundaries.
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_8BQuantRecipe
++
++
++@register_llm_model("qwen3-4b-dflash")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_DFlash(LLMModelConfig):
++    """DFlash draft head for Qwen3-4B, exported as one fused graph per decoding step.
++
++    Not a standalone model: it consumes the target's hidden states at layers [1, 9, 17, 25, 33], which is
++    what `n_target_layers` counts and what `fc` projects. `n_inject` is how many committed rows ride
++    along with each proposed block -- the accepted run from the previous step, padded to a constant
++    because a static graph needs one. Padding is free here: NPU per-call cost is weight streaming,
++    not work, so the rows cost nothing they would not have cost empty.
++
++    Unsharded on purpose. At 5 layers the whole draft is ~1.2 GiB, and every extra shard boundary is
++    another graph invocation -- the exact cost this export exists to avoid.
++    """
++
++    repo_id: str = "deepseek-ai/dflash_qwen3_4b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/4b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    # The draft shares the target's tokenizer and only ever sees templated text at runtime, so its
++    # calibration must be templated too -- and the dataset builder gates chat templating on this.
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftQuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-4B"
++
++
++@register_llm_model("qwen3-4b-dflash-w4")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_DFlash_W4(LLMModelConfig):
++    """Qwen3_4B_DFlash with 4-bit weights.
++
++    Same graph, same calibration, same activation policy; only the weight width changes. It gets its
++    own entry because the NPU's per-call cost is weight streaming at ~18 ms/GB, so halving the
++    weights is the one knob that makes the fused draft cheaper without narrowing the block.
++    """
++
++    repo_id: str = "deepseek-ai/dflash_qwen3_4b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/4b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftW4A16QuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-4B"
++
++
++@register_llm_model("qwen3-4b-dflash-w4a8")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_DFlash_W4A8(LLMModelConfig):
++    """Qwen3_4B_DFlash with 4-bit weights and 8-bit activations."""
++
++    repo_id: str = "deepseek-ai/dflash_qwen3_4b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/4b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftW4A8QuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-4B"
++
++
++@register_llm_model("qwen3-4b-dspark")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_DSpark(LLMModelConfig):
++    """DSpark draft head for Qwen3-4B.
++
++    Body-for-body a DFlash draft -- same five blocks, same tensor set, same fc -- so it exports
++    through the same model class. What makes it DSpark are two heads the graph never sees: a Markov
++    head that re-scores candidates per concrete parent (PCTree, DARTree) and a confidence head that
++    gates proposal length. Both are read from the draft GGUF on the host, so convert_weights drops
++    them and the exported artifact is the same shape as the DFlash one.
++    """
++
++    repo_id: str = "deepseek-ai/dspark_qwen3_4b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/4b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftQuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-4B"
++
++
++@register_llm_model("qwen3-8b-dflash")
++@dataclass(init=False, frozen=True)
++class Qwen3_8B_DFlash(LLMModelConfig):
++    """DFlash draft head for Qwen3-8B, exported as one fused graph per decoding step.
++
++    Not a standalone model: it consumes the target's hidden states at layers [1, 9, 17, 25, 33], which is
++    what `n_target_layers` counts and what `fc` projects. `n_inject` is how many committed rows ride
++    along with each proposed block -- the accepted run from the previous step, padded to a constant
++    because a static graph needs one. Padding is free here: NPU per-call cost is weight streaming,
++    not work, so the rows cost nothing they would not have cost empty.
++
++    Unsharded on purpose. At 5 layers the whole draft is ~1.2 GiB, and every extra shard boundary is
++    another graph invocation -- the exact cost this export exists to avoid.
++    """
++
++    repo_id: str = "deepseek-ai/dflash_qwen3_8b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/8b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    # The draft shares the target's tokenizer and only ever sees templated text at runtime, so its
++    # calibration must be templated too -- and the dataset builder gates chat templating on this.
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftQuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-8B"
++
++
+ @register_llm_model("smollm2_135m")
+ @dataclass(init=False, frozen=True)
+ class Smollm2_135M(LLMModelConfig):
+diff --git a/examples/qualcomm/oss_scripts/llama/dataset/builders.py b/examples/qualcomm/oss_scripts/llama/dataset/builders.py
+index 32496c7..3bc83a2 100644
+--- a/examples/qualcomm/oss_scripts/llama/dataset/builders.py
++++ b/examples/qualcomm/oss_scripts/llama/dataset/builders.py
+@@ -30,6 +30,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.dataset.preprocessors import
+ )
+ from executorch.examples.qualcomm.oss_scripts.llama.dataset.schema import MessageSample
+ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
++    draft_calibrate_ar_len,
+     AUDIO_ENCODER,
+     TEXT_DECODER,
+     TEXT_ENCODER,
+@@ -228,10 +229,17 @@ class DatasetBuilder:
+         # Collator for multimodal encoders
+         self._encoder_collator = ModalityEncoderCollator()
+         # Collator for PTQ calibration: pads tokens and builds attention masks.
++        n_inject = getattr(llm_config, "n_inject", None) or 0
++        pad_len = (
++            draft_calibrate_ar_len(self._data_config.max_context_len, n_inject)
++            if n_inject
++            else self._data_config.max_context_len
++        )
+         self._calib_collator = LLMCalibCollator(
+             self._attn_mask,
+             self._data_config.max_context_len,
+             self._data_config.token_dtype,
++            pad_len=pad_len,
+         )
+         # Collator for QAT training: pads tokens, builds masks, and labels.
+         self._train_collator = LLMTrainingCollator(
+diff --git a/examples/qualcomm/oss_scripts/llama/dataset/collators.py b/examples/qualcomm/oss_scripts/llama/dataset/collators.py
+index 319ea6e..eb0718c 100644
+--- a/examples/qualcomm/oss_scripts/llama/dataset/collators.py
++++ b/examples/qualcomm/oss_scripts/llama/dataset/collators.py
+@@ -59,20 +59,37 @@ class LLMCalibCollator:
+         attn_mask_template: AttentionMask,
+         max_context_len: int,
+         token_dtype: torch.dtype = torch.int32,
++        pad_len: int = None,
+     ) -> None:
+         self._template = attn_mask_template
+         self._max_context_len = max_context_len
++        # Tokens usually fill the whole window. A speculative draft head does not: part of its
++        # window is the committed rows that arrive as hidden states, so its token side is shorter
++        # than the mask by exactly that many rows.
++        self._pad_len = pad_len if pad_len is not None else max_context_len
+         self._token_dtype = token_dtype
+ 
+     def __call__(self, batch: List[Tuple]) -> Dict[str, Union[torch.Tensor, Tuple]]:
+         token_ids = [item[0] for item in batch]
++        # _pad_and_stack pads up to the target width but does not cut anything longer, which was
++        # invisible while the width was the whole context. A draft head calibrates on a narrower
++        # window -- it has to leave room for the committed rows and a real cache -- so prompts can
++        # now overrun it, and a 647-token prompt against a 504-wide graph is a shape error deep in
++        # the model rather than anything that names the prompt.
++        token_ids = [t[: self._pad_len] for t in token_ids]
+         attn = AttentionMask.from_input_ids(
+-            self._template, token_ids, self._max_context_len
++            self._template,
++            token_ids,
++            self._max_context_len,
++            # query axis is the token side; the extra key columns are the committed rows a draft
++            # head attends over, and they are open, not padding
++            ar_len=self._pad_len,
++            open_prefix=self._max_context_len - self._pad_len,
+         )
+         attention_mask = tuple(m.mask for m in attn.masks)
+         return {
+             "input_ids": _pad_and_stack(
+-                token_ids, self._max_context_len, self._token_dtype
++                token_ids, self._pad_len, self._token_dtype
+             ),
+             "attention_mask": attention_mask,
+             "labels": None,
+diff --git a/examples/qualcomm/oss_scripts/llama/decoder_constants.py b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
+index 26e5aee..e12d6d3 100644
+--- a/examples/qualcomm/oss_scripts/llama/decoder_constants.py
++++ b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
+@@ -58,6 +58,20 @@ DECODER_MODEL_VERSION = {
+     "qwen2_5-1_5b": "qwen2_5",
+     "qwen3-0_6b": "qwen3",
+     "qwen3-1_7b": "qwen3",
++    "qwen3-4b": "qwen3",
++    "qwen3-4b-w8": "qwen3",
++    "qwen3-4b-kv16": "qwen3",
++    "qwen3-4b-kv16-mse": "qwen3",
++    "qwen3-4b-kv16-hist": "qwen3",
++    "qwen3-4b-sqnr": "qwen3",
++    "qwen3-4b-r2": "qwen3",
++    "qwen3-4b-lc": "qwen3",
++    "qwen3-8b": "qwen3",
++    "qwen3-4b-dflash": "qwen3",
++    "qwen3-4b-dflash-w4": "qwen3",
++    "qwen3-4b-dflash-w4a8": "qwen3",
++    "qwen3-4b-dspark": "qwen3",
++    "qwen3-8b-dflash": "qwen3",
+     "smollm2_135m": "smollm2_135m",
+     "smollm3-3b": "smollm3",
+     "glm-1_5b": "glm",
+@@ -65,3 +79,18 @@ DECODER_MODEL_VERSION = {
+     "internvl3_1b": "internvl3",
+     "gemma4-e2b": "gemma4",
+ }
++
++
++def draft_calibrate_ar_len(max_context_len: int, n_inject: int) -> int:
++    """Block width for a draft head's CALIBRATE graph.
++
++    An ordinary decoder calibrates with ar_len == max_context_len, which leaves cache_len at zero --
++    fine, because that graph consumes the whole context in one shot and never reads a cache. A draft
++    head does read one, every step after the first, and the encodings collected here are copied onto
++    the DECODE and PREFILL graphs. Calibrating with no cache therefore hands the deployed graph
++    quantization parameters for a tensor it never observed, which shows up as a run that is correct
++    on step 0 and degrades from step 1.
++
++    Halving the window leaves room for a real cache to be filled during calibration.
++    """
++    return (max_context_len - n_inject) // 2
+diff --git a/examples/qualcomm/oss_scripts/llama/dump_target_hidden.py b/examples/qualcomm/oss_scripts/llama/dump_target_hidden.py
+new file mode 100644
+index 0000000..ee03c0c
+--- /dev/null
++++ b/examples/qualcomm/oss_scripts/llama/dump_target_hidden.py
+@@ -0,0 +1,85 @@
++#!/usr/bin/env python3
++"""Dump the target hidden states a DFlash draft is quantized against.
++
++Every other model in this pipeline is calibrated by feeding it tokens. A DFlash draft cannot be:
++its input is not an embedding table lookup, it is the target model's hidden states at five layers,
++concatenated. Feed it token embeddings during calibration and the observers on `fc` learn the wrong
++range entirely -- and `fc` is the tensor everything downstream reads.
++
++So the ranges have to come from the target actually running. This dumps them once, offline, in
++bf16, and the draft export replays the dump.
++
++    python dump_target_hidden.py --target Qwen/Qwen3-8B --calib calib.json --out hidden_8b.pt
++
++The layer indices are the DFlash convention: `target_layer_ids` names decoder layers, and
++extract_context_feature reads `hidden_states[layer_id + 1]` because HuggingFace puts the embedding
++output at index 0. For Qwen3 that makes [1,9,17,25,33] into hidden_states indices [2,10,18,26,34] --
++the same five tensors the QNN target already exposes at its shard boundaries, which is not a
++coincidence: the boundaries were chosen to land there.
++"""
++
++import argparse
++import json
++
++import torch
++from transformers import AutoModelForCausalLM, AutoTokenizer
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--target", required=True, help="HF repo id or local path of the TARGET model")
++    ap.add_argument("--calib", required=True, help="JSON file: a list of prompt strings")
++    ap.add_argument("--out", required=True)
++    ap.add_argument("--layer-ids", default="1,9,17,25,33")
++    ap.add_argument("--max-len", type=int, default=512)
++    ap.add_argument("--limit", type=int, default=0, help="cap the number of prompts (0 = all)")
++    args = ap.parse_args()
++
++    layer_ids = [int(x) for x in args.layer_ids.split(",")]
++    raw = json.load(open(args.calib))
++    if isinstance(raw, dict):
++        raw = raw.get("prompts", list(raw.values()))
++    if args.limit:
++        raw = raw[: args.limit]
++
++    tok = AutoTokenizer.from_pretrained(args.target)
++
++    # The runtime always applies the chat template (DFLASH_CHAT=1), and templating moves the
++    # activations enough to matter -- on raw prompts several Spec-Bench categories degenerate into
++    # repetition loops. Calibrate on what the model will actually see.
++    def render(item):
++        if isinstance(item, str):
++            return item
++        msgs = item["messages"] if "messages" in item else item
++        return tok.apply_chat_template(
++            msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False
++        )
++
++    prompts = [render(p) for p in raw]
++    model = AutoModelForCausalLM.from_pretrained(
++        args.target, dtype=torch.bfloat16, device_map="cpu"
++    ).eval()
++
++    chunks = []
++    with torch.no_grad():
++        for i, p in enumerate(prompts):
++            ids = tok(p, return_tensors="pt", truncation=True, max_length=args.max_len,
++                      add_special_tokens=False).input_ids
++            out = model(ids, output_hidden_states=True, use_cache=False)
++            # [1, seq, dim*len(layer_ids)] -- same concat order the draft's fc expects
++            h = torch.cat([out.hidden_states[j + 1] for j in layer_ids], dim=-1)
++            chunks.append(h[0].to(torch.float32))
++            print(f"  [{i + 1}/{len(prompts)}] {ids.shape[1]:4d} tokens -> {tuple(h.shape[1:])}")
++
++    stacked = torch.cat(chunks, dim=0)
++    torch.save({"hidden": stacked, "layer_ids": layer_ids, "target": args.target}, args.out)
++    a = stacked.abs()
++    print(f"\nwrote {args.out}: {tuple(stacked.shape)}")
++    print(f"  range [{stacked.min():.3f}, {stacked.max():.3f}]  "
++          f"mean|x| {a.mean():.4f}  p99.9 {a.flatten().kthvalue(int(a.numel() * 0.999))[0]:.3f}")
++    print("  If the max is far above p99.9 the export's min/max observers will spend most of the "
++          "range on outliers -- worth knowing before blaming the draft for a low acceptance length.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/qualcomm/oss_scripts/llama/inference/__init__.py b/examples/qualcomm/oss_scripts/llama/inference/__init__.py
+index 9f50005..8fb5cc1 100644
+--- a/examples/qualcomm/oss_scripts/llama/inference/__init__.py
++++ b/examples/qualcomm/oss_scripts/llama/inference/__init__.py
+@@ -7,6 +7,7 @@
+ from executorch.examples.qualcomm.oss_scripts.llama.inference.decoder import (
+     DecoderInference,
+     DecoderInputs,
++    DFlashDecoderInference,
+     merge_modality_embeddings,
+ )
+ from executorch.examples.qualcomm.oss_scripts.llama.inference.encoder import (
+@@ -19,6 +20,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.inference.model import (
+ __all__ = [
+     "DecoderInputs",
+     "DecoderInference",
++    "DFlashDecoderInference",
++    "DFlashDecoderInference",
+     "EncoderInference",
+     "ModelInference",
+     "merge_modality_embeddings",
+diff --git a/examples/qualcomm/oss_scripts/llama/inference/decoder.py b/examples/qualcomm/oss_scripts/llama/inference/decoder.py
+index 03b38e9..11e7fb4 100644
+--- a/examples/qualcomm/oss_scripts/llama/inference/decoder.py
++++ b/examples/qualcomm/oss_scripts/llama/inference/decoder.py
+@@ -8,7 +8,10 @@ from dataclasses import dataclass
+ from typing import Callable, List, Optional, Tuple, Union
+ 
+ import torch
+-from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import AttentionMask
++from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import (
++    AttentionMask,
++    PADDING_MASK_VALUE,
++)
+ 
+ 
+ def merge_modality_embeddings(
+@@ -162,3 +165,148 @@ class DecoderInference:
+             return out[0] if isinstance(out, (tuple, list)) else out
+ 
+         return _forward
++
++
++class DFlashDecoderInference(DecoderInference):
++    """Calibration/eval driver for a DFlash draft head.
++
++    Two things differ from an ordinary decoder. The graph takes seven inputs rather than five --
++    the target's hidden states and their positions ride alongside the block tokens -- and the
++    hidden states cannot be produced by this loop, because they come from a model that is not
++    being exported. They are replayed from a dump taken offline with the bf16 target
++    (see dump_target_hidden.py).
++
++    Replaying matters more than it sounds. Feed the observers token embeddings and `fc` learns a
++    range that has nothing to do with what it will see: on Qwen3-4B the target's layer-33 hidden
++    reaches 16384 through a few always-large channels while its mean |x| is 4.5. Calibrate on the
++    wrong distribution and the draft is quantized for a world it never inhabits.
++    """
++
++    def __init__(self, get_example_inputs: Callable, hidden_dump: str,
++                 n_inject: int = 16, n_target_layers: int = 5, embedding=None,
++                 mask_token_id: int = None, **kwargs):
++        ex = get_example_inputs()
++        assert len(ex) == 7, (
++            f"DFlashDecoderInference expects (target_hidden, tokens, atten_mask, pos, pos_ctx, "
++            f"k_caches, v_caches); got {len(ex)} elements."
++        )
++        _, _, self._default_attn_mask, _, _, self._k_caches, self._v_caches = ex
++        self.max_context_len = kwargs.get("max_context_len", 1024)
++        self.max_batch_size = kwargs.get("max_batch_size", 1)
++        self.audio_token_id = None
++        self.image_token_id = None
++        self._dtype = torch.int64 if kwargs.get("use_i64_token", False) else torch.int32
++        self.pos_ids = (
++            torch.arange(self.max_context_len, dtype=torch.int32)
++            .unsqueeze(0).expand(self.max_batch_size, -1).contiguous()
++        )
++        self.n_inject = n_inject
++        self.n_target_layers = n_target_layers
++        # The graph takes block embeddings, not token ids -- the table is not in it. Keep a
++        # reference so calibration can do the lookup the runtime does on the host.
++        self._embedding = embedding
++        blob = torch.load(hidden_dump, weights_only=False)
++        self._hidden = blob["hidden"] if isinstance(blob, dict) else blob
++        self._cursor = 0
++        self._cache_pos = 0   # how much of the calibration cache holds real values
++        self._mask_token_id = mask_token_id
++
++    def _embed(self, ids: torch.Tensor) -> torch.Tensor:
++        if self._embedding is None:
++            raise RuntimeError(
++                "DFlashDecoderInference needs the embedding table: the graph takes block "
++                "embeddings, so calibration has to look the ids up itself."
++            )
++        return self._embedding(ids).float()
++
++    def _next_hidden(self) -> List[torch.Tensor]:
++        """Take the next n_inject rows of the dump, split per target layer.
++
++        Wraps around rather than stopping: calibration wants coverage of the distribution, and the
++        loop runs for as many steps as the dataset dictates, not as many rows as were dumped.
++        """
++        n, total = self.n_inject, self._hidden.shape[0]
++        idx = (torch.arange(n) + self._cursor) % total
++        self._cursor = (self._cursor + n) % total
++        rows = self._hidden[idx].unsqueeze(0)                       # [1, n, dim*n_target_layers]
++        dim = rows.shape[-1] // self.n_target_layers
++        return [rows[..., i * dim:(i + 1) * dim].contiguous()
++                for i in range(self.n_target_layers)]
++
++    def make_forward_fn(self) -> Callable:
++        """Calibrate the way the graph will actually run: with a cache that fills up.
++
++        The base loop hands the model the same zero-filled cache on every call, which is right for a
++        decoder whose CALIBRATE graph swallows the whole context at once and never reads one. A draft
++        head reads its cache on every step after the first, and the encodings collected here are
++        copied onto the DECODE and PREFILL graphs -- so calibrating against an empty cache sets the
++        quantization parameters for a tensor that was never observed. The symptom is a run that is
++        exactly right on step 0 and falls apart on step 1.
++
++        So the committed rows this call produces are written back into the cache, the position cursor
++        advances, and the mask opens the part of the cache that now holds real values.
++        """
++        n_inject, nxt = self.n_inject, self._next_hidden
++        self_ref = self
++
++        def _forward(model, model_inputs: dict) -> torch.Tensor:
++            k, v = self_ref._k_caches, self_ref._v_caches
++            pos = self_ref.pos_ids
++            cache_len = k[0].shape[-1] if len(k) else 0
++            cur = self_ref._cache_pos
++
++            input_ids = model_inputs["input_ids"]
++            ar_len = input_ids.shape[-1]
++            # Calibrate the block the way it is actually decoded: one real token followed by mask
++            # tokens. The dataset hands over a run of ordinary text, but a diffusion-style draft
++            # never sees that -- every step it gets [id_last, mask, mask, ...] and denoises the
++            # masked positions in parallel. Feeding real text here freezes activation scales for a
++            # distribution that does not occur in deployment, and the observers cannot be re-fit
++            # later: their encodings are copied straight onto the DECODE and PREFILL graphs.
++            if self_ref._mask_token_id is not None:
++                blk = torch.full_like(input_ids, self_ref._mask_token_id)
++                blk[:, 0] = input_ids[:, 0]
++                input_ids = blk
++            pos_ctx = pos[:, cur:cur + n_inject]
++            pos_blk = pos[:, cur + n_inject:cur + n_inject + ar_len]
++
++            masks = []
++            for m in model_inputs["attention_mask"]:
++                m = m.clone()
++                m[..., :cache_len] = PADDING_MASK_VALUE          # close the whole cache, then
++                if cur > 0:
++                    m[..., :cur] = 0                             # reopen only what has been written
++                m[..., cache_len:cache_len + n_inject] = 0       # this step's committed rows
++                masks.append(m)
++
++            out = model(*nxt(), self_ref._embed(input_ids), *masks, pos_blk, pos_ctx, *k, *v)
++
++            # write the committed rows back, exactly as the runtime does
++            if isinstance(out, (tuple, list)) and len(out) > 1 and cache_len:
++                tail = list(out[1:])
++                flat = []
++                for x in tail:
++                    flat.extend(x) if isinstance(x, (list, tuple)) else flat.append(x)
++                half = len(flat) // 2
++                room = min(n_inject, cache_len - cur)
++                if room > 0:
++                    for i in range(half):
++                        k[i][..., cur:cur + room] = flat[i][..., :room].detach()
++                        v[i][:, :, cur:cur + room, :] = flat[half + i][:, :, :room, :].detach()
++                self_ref._cache_pos = (cur + room) % max(1, cache_len - n_inject)
++
++            return out[0] if isinstance(out, (tuple, list)) else out
++
++        return _forward
++
++    @torch.no_grad()
++    def predict_step(self, module, input_ids, attn_mask=None, hidden_states=(), tok_embedding=None):
++        mask = attn_mask if attn_mask is not None else self._default_attn_mask
++        ar_len = input_ids.shape[-1]
++        logits, *_ = module(
++            *self._next_hidden(), self._embed(input_ids), *mask,
++            self.pos_ids[:, self.n_inject:self.n_inject + ar_len],
++            self.pos_ids[:, :self.n_inject],
++            *self._k_caches, *self._v_caches,
++        )
++        return logits
+diff --git a/examples/qualcomm/oss_scripts/llama/llama.py b/examples/qualcomm/oss_scripts/llama/llama.py
+index 0208ebe..d309547 100755
+--- a/examples/qualcomm/oss_scripts/llama/llama.py
++++ b/examples/qualcomm/oss_scripts/llama/llama.py
+@@ -266,7 +266,7 @@ def inference(
+         DataConfig.from_args(args),
+         decoder_model_config,
+         tokenizer_wrapper,
+-        attn_mask=source_model.get_example_inputs()[1],
++        attn_mask=source_model.get_attn_mask_template(),
+     )
+     if PROMPT_EVAL in args.eval_methods:
+         prompt_evaluator = DefaultEval(
+@@ -608,6 +608,14 @@ def _build_parser():
+         help="Number of examples to calibrate in few-shot context",
+     )
+ 
++    parser.add_argument(
++        "--dflash_hidden",
++        help="Path to a target-hidden dump produced by dump_target_hidden.py. Required when "
++        "exporting a DFlash draft head: its activations are the TARGET model's hidden states, so "
++        "calibrating it on token prompts would set every observer from the wrong distribution.",
++        default=None,
++        type=str,
++    )
+     parser.add_argument(
+         "--calib_samples",
+         nargs="+",
+diff --git a/examples/qualcomm/oss_scripts/llama/masking_utils.py b/examples/qualcomm/oss_scripts/llama/masking_utils.py
+index 5561f25..911e3d3 100644
+--- a/examples/qualcomm/oss_scripts/llama/masking_utils.py
++++ b/examples/qualcomm/oss_scripts/llama/masking_utils.py
+@@ -5,7 +5,7 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ from abc import ABC, abstractmethod
+-from typing import List, Tuple, Union
++from typing import List, Optional, Tuple, Union
+ 
+ import torch
+ 
+@@ -176,12 +176,28 @@ class CausalAttentionMask(BaseAttentionMask):
+ 
+     @classmethod
+     def from_input_ids(
+-        cls, input_ids: List[List[int]], max_seq_length: int, **kwargs
++        cls,
++        input_ids: List[List[int]],
++        max_seq_length: int,
++        ar_len: Optional[int] = None,
++        open_prefix: int = 0,
++        **kwargs,
+     ) -> "CausalAttentionMask":
+-        """Build a causal mask and apply padding for variable-length sequences."""
+-        mask = cls(len(input_ids), max_seq_length, max_seq_length)
++        """Build a causal mask and apply padding for variable-length sequences.
++
++        The query axis is normally the key axis: one token per position, attending over the same
++        window. A speculative draft head breaks that -- it queries only the block it is proposing
++        while attending over the committed rows as well -- so `ar_len` lets the two differ, and
++        `open_prefix` unmasks the leading key columns those committed rows occupy. Left masked they
++        would be computed and then ignored, which is not what the graph does at run time and so not
++        what its observers should see.
++        """
++        ar_len = ar_len or max_seq_length
++        mask = cls(len(input_ids), ar_len, max_seq_length)
+         mask._mask = mask._mask.clone()
+-        mask._mask_padding_positions(input_ids, max_seq_length)
++        if open_prefix:
++            mask._mask[:, :, :, :open_prefix] = 0
++        mask._mask_padding_positions(input_ids, ar_len)
+         return mask
+ 
+ 
+@@ -295,6 +311,8 @@ class AttentionMask:
+         template: "AttentionMask",
+         input_ids: List[List[int]],
+         max_seq_length: int,
++        ar_len: Optional[int] = None,
++        open_prefix: int = 0,
+     ) -> "AttentionMask":
+         """
+         Build a calibration AttentionMask that mirrors template's mask types.
+@@ -305,7 +323,8 @@ class AttentionMask:
+         """
+         masks = [
+             type(base_mask).from_input_ids(
+-                input_ids, max_seq_length, **base_mask._extra_init_kwargs()
++                input_ids, max_seq_length, ar_len=ar_len, open_prefix=open_prefix,
++                **base_mask._extra_init_kwargs()
+             )
+             for base_mask in template.masks
+         ]
+diff --git a/examples/qualcomm/oss_scripts/llama/model/dflash_draft.py b/examples/qualcomm/oss_scripts/llama/model/dflash_draft.py
+new file mode 100644
+index 0000000..dd19862
+--- /dev/null
++++ b/examples/qualcomm/oss_scripts/llama/model/dflash_draft.py
+@@ -0,0 +1,337 @@
++# Copyright (c) Qualcomm Innovation Center, Inc.
++# All rights reserved
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++"""DFlash speculative-decoding draft head, as a single fused graph.
++
++A DFlash draft is a small decoder (5 layers) that proposes a block of tokens for a large target to
++verify. It differs from an ordinary decoder in where its keys and values come from:
++
++    Q  comes from the block rows only -- the masked positions being proposed.
++    KV comes from two places: the block rows, and the *target's* hidden states for the tokens that
++       have already been committed, projected once by fc + hidden_norm.
++
++The committed-token branch is what makes this worth a custom module. Those rows never join the
++residual stream: every layer projects K and V straight off the same fc output, so the branch has no
++sequential dependency on the block branch at all. Reference implementations (and our llama.cpp port)
++still run it as a separate "inject" pass followed by a "block" pass, which is a KV-cache-plumbing
++convenience rather than anything the architecture asks for.
++
++On a QNN target that split is expensive. Per-call cost there is essentially pure weight streaming --
++measured at -3.9 ms + 18.0 ms/GB across three contexts, i.e. an intercept of zero -- so cost is set
++by how many times the weights are read, not by how much work each read does. Two passes cost twice
++one pass even though the inject pass is a handful of rows. Fusing them into one graph is therefore
++worth roughly the whole inject stage, and it is exact, not an approximation.
++
++Padding the committed-row count to a fixed maximum is free for the same reason, which is what makes
++a static export viable at all: `n_inject` rows are always processed, and the caller masks off the
++ones that are not real.
++
++The five target hidden states arrive as five separate tensors rather than one concatenation, and fc
++is carried as five blocks that are summed -- algebraically the same projection, but it gives each
++layer its own activation scale. Concatenating first would force one scale across all five, and they
++are not remotely comparable: measured on Qwen3-4B over Spec-Bench prompts, layer 1 spans +/-60 with
++mean |x| 0.155 while layers 9-33 reach 16384 through a handful of always-large channels (21 of
++12800 exceed 100, at fixed positions 0, 4 and 396 within each block). One 16-bit scale set by 16384
++gives a step of 0.32, which rounds most of layer 1 to zero -- the layer would be gone.
++"""
++
++from typing import List, Optional, Tuple
++
++import torch
++import torch.nn as nn
++
++from executorch.examples.models.llama.model_args import ModelArgs
++
++from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import (
++    AttentionMask,
++    CausalAttentionMask,
++)
++
++from .static_llama import (
++    LlamaAttention,
++    LlamaDecoderLayer,
++    LlamaModel,
++    NORM_REGISTRY,
++    repeat_kv,
++)
++
++
++class DFlashAttention(LlamaAttention):
++    """LlamaAttention with a second, layer-invariant KV source.
++
++    `g_ctx` is the fc-projected target hidden for the committed tokens. It is already normalized
++    (hidden_norm runs once, in the model) and is deliberately NOT passed through the per-layer
++    attention_norm -- the reference projects it raw at every layer.
++
++    Only the committed rows are returned as new cache entries. The block rows' K/V are speculative:
++    they are consumed by this call's own attention and then thrown away, because the next step
++    re-derives them from whatever the target actually accepted.
++    """
++
++    def _ctx_kv(self, g_ctx, freqs_cos_ctx, freqs_sin_ctx, conv: bool):
++        bsz, ctx_len, _ = g_ctx.shape
++        if conv:
++            g = torch.reshape(g_ctx, (bsz, ctx_len, 1, self.dim)).transpose(1, 3)
++            k = self.wk_conv(g).permute(0, 3, 1, 2).squeeze(-1)
++            v = self.wv_conv(g).permute(0, 3, 1, 2).squeeze(-1)
++        else:
++            k = self.wk(g_ctx)
++            v = self.wv(g_ctx)
++        k = k.view(bsz, ctx_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
++        v = v.view(bsz, ctx_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
++
++        # k_norm applies to the committed keys too: the reference norms the concatenation of
++        # context and block keys, so both sides see it.
++        if self.use_qk_norm and self.qk_norm_before_rope:
++            k = self.k_norm_fn(k)
++        if self.use_rope:
++            k = self.apply_rope_emb(k, freqs_cos_ctx, freqs_sin_ctx)
++        if self.use_qk_norm and not self.qk_norm_before_rope:
++            k = self.k_norm_fn(k)
++        if getattr(self.config, "enable_r3", False):
++            k = torch.matmul(k, self.r3_weight)
++        return k.transpose(2, 3), v
++
++    def _forward_impl(
++        self,
++        hidden_states: torch.Tensor,
++        g_ctx: torch.Tensor,
++        freqs_cos: torch.Tensor,
++        freqs_sin: torch.Tensor,
++        freqs_cos_ctx: torch.Tensor,
++        freqs_sin_ctx: torch.Tensor,
++        atten_mask: torch.Tensor,
++        k_caches: List[torch.Tensor],
++        v_caches: List[torch.Tensor],
++        conv: bool,
++    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        bsz, seq_len, _ = hidden_states.shape
++
++        if conv:
++            h = torch.reshape(hidden_states, (bsz, seq_len, 1, self.dim)).transpose(1, 3)
++            q = self.wq_conv(h).permute(0, 3, 1, 2).squeeze(-1)
++            k = self.wk_conv(h).permute(0, 3, 1, 2).squeeze(-1)
++            v = self.wv_conv(h).permute(0, 3, 1, 2).squeeze(-1)
++        else:
++            q = self.wq(hidden_states)
++            k = self.wk(hidden_states)
++            v = self.wv(hidden_states)
++        q = q.view(bsz, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
++        k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
++        v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
++
++        if self.use_qk_norm and self.qk_norm_before_rope:
++            q = self.q_norm_fn(q)
++            k = self.k_norm_fn(k)
++        if self.use_rope:
++            q = self.apply_rope_emb(q, freqs_cos, freqs_sin)
++            k = self.apply_rope_emb(k, freqs_cos, freqs_sin)
++        if self.use_qk_norm and not self.qk_norm_before_rope:
++            q = self.q_norm_fn(q)
++            k = self.k_norm_fn(k)
++        if getattr(self.config, "enable_r3", False):
++            q = torch.matmul(q, self.r3_weight)
++            k = torch.matmul(k, self.r3_weight)
++        k = k.transpose(2, 3)
++
++        k_ctx, v_ctx = self._ctx_kv(g_ctx, freqs_cos_ctx, freqs_sin_ctx, conv)
++
++        # order matters: [ past | committed-this-step | block ] must match how the caller lays out
++        # atten_mask and how the runtime appends k_ctx/v_ctx to the cache.
++        kh = torch.cat([k_caches, k_ctx, k], dim=-1)
++        vh = torch.cat([v_caches, v_ctx, v], dim=2)
++
++        kh = repeat_kv(kh, self.num_key_value_groups)
++        vh = repeat_kv(vh, self.num_key_value_groups)
++
++        attn = q @ kh
++        attn = attn / self.scale
++        if self.enable_masked_softmax:
++            attn_min = torch.amin(attn, dim=-1, keepdim=True)
++            attn = torch.where(atten_mask == 0, attn, attn_min + (-20))
++        else:
++            attn = attn + atten_mask
++        attn = self.attn_softmax(attn)
++        y = attn @ vh
++        y = y.transpose(1, 2)
++        if conv:
++            y = y.reshape(bsz, seq_len, 1, -1).transpose(1, 3)
++            y = self.wo_conv(y).transpose(1, 3).reshape(bsz, seq_len, -1)
++        else:
++            y = y.reshape(bsz, seq_len, -1)
++            y = self.wo(y)
++
++        # only the committed rows persist; the block's own K/V die with this call
++        return y, [k_ctx], [v_ctx]
++
++    def forward(self, hidden_states, g_ctx, freqs_cos, freqs_sin, freqs_cos_ctx,
++                freqs_sin_ctx, atten_mask, k_caches, v_caches):
++        return self._forward_impl(hidden_states, g_ctx, freqs_cos, freqs_sin,
++                                  freqs_cos_ctx, freqs_sin_ctx, atten_mask,
++                                  k_caches, v_caches, conv=False)
++
++    def forward_attention_conv(self, hidden_states, g_ctx, freqs_cos, freqs_sin,
++                               freqs_cos_ctx, freqs_sin_ctx, atten_mask, k_caches, v_caches):
++        return self._forward_impl(hidden_states, g_ctx, freqs_cos, freqs_sin,
++                                  freqs_cos_ctx, freqs_sin_ctx, atten_mask,
++                                  k_caches, v_caches, conv=True)
++
++
++class DFlashDecoderLayer(LlamaDecoderLayer):
++    def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
++        super().__init__(layer_idx, config, output_new_cache_only)
++        self.attention = DFlashAttention(
++            layer_idx=layer_idx, config=config, output_new_cache_only=output_new_cache_only
++        )
++
++    def forward(self, x, g_ctx, freqs_cos, freqs_sin, freqs_cos_ctx, freqs_sin_ctx,
++                atten_mask, k_caches, v_caches):
++        hidden_states = self.attention_norm(x)
++        h, k_cache, v_cache = self.attention(
++            hidden_states=hidden_states,
++            g_ctx=g_ctx,
++            freqs_cos=freqs_cos,
++            freqs_sin=freqs_sin,
++            freqs_cos_ctx=freqs_cos_ctx,
++            freqs_sin_ctx=freqs_sin_ctx,
++            atten_mask=atten_mask,
++            k_caches=k_caches,
++            v_caches=v_caches,
++        )
++        h = x + h
++        out = self.feed_forward(self.ffn_norm(h))
++        return h + out, k_cache, v_cache
++
++
++class DFlashDraftModel(LlamaModel):
++    """One graph per decoding step: commit the accepted tokens and propose the next block.
++
++    ar_len is the block width (how many masked positions are proposed). n_inject is the fixed number
++    of committed rows carried in alongside; the caller pads up to it and masks the remainder.
++    """
++
++    def __init__(self, config: ModelArgs, ar_len=1, output_new_cache_only=True,
++                 output_cache=True, use_i64_token=False, n_inject=8,
++                 n_target_layers=5, **kwargs):
++        super().__init__(
++            config=config, ar_len=ar_len, output_new_cache_only=output_new_cache_only,
++            output_cache=output_cache, use_i64_token=use_i64_token, **kwargs
++        )
++        self.n_inject = n_inject
++        self.n_target_layers = n_target_layers
++        self.layers = nn.ModuleList(
++            [DFlashDecoderLayer(i, config, output_new_cache_only) for i in range(config.n_layers)]
++        )
++        # one block per target layer, summed in forward: sum_i fc_i(h_i) == fc(cat(h_i))
++        self.fc = nn.ModuleList(
++            [nn.Linear(config.dim, config.dim, bias=False) for _ in range(n_target_layers)]
++        )
++        self.hidden_norm = NORM_REGISTRY[config.norm_type](config.dim, eps=config.norm_eps)
++
++    def forward(
++        self,
++        h_0: torch.Tensor,
++        h_1: torch.Tensor,
++        h_2: torch.Tensor,
++        h_3: torch.Tensor,
++        h_4: torch.Tensor,
++        block_embd: torch.Tensor,
++        atten_mask: torch.Tensor,
++        input_pos: torch.Tensor,
++        input_pos_ctx: torch.Tensor,
++        *args,
++    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
++        """One target hidden per layer, named rather than packed.
++
++        The five could have been one varargs tail, and briefly were. But the export pipeline
++        identifies KV cache inputs by placeholder name -- it looks for `args_<i>` and reads <i> as
++        the layer index -- so anything else sharing that varargs would be mistaken for a cache. Only
++        the caches may be varargs; everything in front has to be named.
++
++        Fixed at five because that is what a DFlash draft is: `target_layer_ids` has five entries
++        for both the 4B and 8B heads, and fc is built to match.
++        """
++        assert self.n_target_layers == 5, (
++            f"this forward names five target hidden inputs; config says {self.n_target_layers}"
++        )
++        target_hidden = [h_0, h_1, h_2, h_3, h_4]
++
++        # block_embd, not token ids: the caller looks the block up and hands over the vectors. The
++        # embedding table is 29.6% of this model's weights (389M of 1315M, a 151936x2560 table the
++        # draft carries a second copy of because output.weight holds the same values in its own
++        # storage), and keeping the lookup in the graph makes the NPU stream all of it to fetch
++        # eight rows a step. On a device whose per-call cost is weight streaming at ~18 ms/GB that
++        # is ~7 ms of every ~60 ms step. forward never touching self.tok_embeddings is what keeps
++        # the table out of the artifact: unused parameters are stripped at to_edge time. The table
++        # stays on the module for the calibration loop, and the host needs its own copy at fp16 --
++        # not the Q4_0 one the target GGUF already carries, which costs 5 of 8 argmax on its own
++        # (logit cosine 0.9371 against fp32; Q8_0 is 7 of 8, fp16 and bf16 are exact).
++
++        hidden_states = block_embd
++
++        output_k_cache = []
++        output_v_cache = []
++        freqs_cos = self.freqs_cos[input_pos][0]
++        freqs_sin = self.freqs_sin[input_pos][0]
++        freqs_cos_ctx = self.freqs_cos[input_pos_ctx][0]
++        freqs_sin_ctx = self.freqs_sin[input_pos_ctx][0]
++
++        g_ctx = self.hidden_norm(
++            sum(fc_i(h_i) for fc_i, h_i in zip(self.fc, target_hidden))
++        )
++
++        for ind, decoder_layer in enumerate(self.layers):
++            hidden_states, k, v = decoder_layer(
++                hidden_states,
++                g_ctx=g_ctx,
++                freqs_cos=freqs_cos,
++                freqs_sin=freqs_sin,
++                freqs_cos_ctx=freqs_cos_ctx,
++                freqs_sin_ctx=freqs_sin_ctx,
++                atten_mask=atten_mask,
++                k_caches=args[ind],
++                v_caches=args[self.n_layers + ind],
++            )
++            output_k_cache.extend(k)
++            output_v_cache.extend(v)
++
++        logits = self.output(self.norm(hidden_states))
++        if self.logits_scaling:
++            logits = logits / self.logits_scaling
++        if self.output_cache:
++            return logits, output_k_cache, output_v_cache
++        return logits
++
++    def get_example_inputs(self):
++        b, n_ctx = self.max_batch_size, self.n_inject
++        target_hidden = [
++            torch.randn((b, n_ctx, self.dim), dtype=torch.float32)
++            for _ in range(self.n_target_layers)
++        ]
++        block_embd = torch.randn((b, self.ar_len, self.dim), dtype=torch.float32)
++        # Total keys per step must come to max_seq_len, the width every mask in this pipeline is
++        # built at: past cache + this step's committed rows + the block.
++        cache_len = self.max_context_len - self.n_inject - self.ar_len
++        atten_mask = AttentionMask(
++            CausalAttentionMask(b, self.ar_len, self.max_context_len)
++        )
++        pos = torch.zeros((b, self.ar_len), dtype=torch.int32)
++        pos_ctx = torch.zeros((b, n_ctx), dtype=torch.int32)
++        k_cache, v_cache = [], []
++        for _ in range(self.n_layers):
++            k_cache.append(torch.zeros(b, self.n_kv_heads, self.head_dim, cache_len))
++            v_cache.append(torch.zeros(b, self.n_kv_heads, cache_len, self.head_dim))
++        # Nested, in the shape the wrapper's export_input builder indexes positionally; the model
++        # itself takes the flattened version that builder produces.
++        return (target_hidden, block_embd, atten_mask, pos, pos_ctx, k_cache, v_cache)
++
++    def get_attn_mask_template(self):
++        return self.get_example_inputs()[2]
++
++    def get_metadata(self):
++        meta = super().get_metadata()
++        meta["n_inject"] = self.n_inject
++        meta["n_target_layers"] = self.n_target_layers
++        return meta
+diff --git a/examples/qualcomm/oss_scripts/llama/model/static_llama.py b/examples/qualcomm/oss_scripts/llama/model/static_llama.py
+index dc70e2c..0ec42eb 100755
+--- a/examples/qualcomm/oss_scripts/llama/model/static_llama.py
++++ b/examples/qualcomm/oss_scripts/llama/model/static_llama.py
+@@ -804,6 +804,15 @@ class LlamaModel(nn.Module):
+             atten_mask,
+         )
+ 
++    def get_attn_mask_template(self):
++        """The attention-mask template, by position in get_example_inputs().
++
++        Callers used to index [1] directly. That holds for every decoder whose first input is the
++        token tensor, which stopped being all of them once a draft head arrived with five hidden
++        tensors in front.
++        """
++        return self.get_example_inputs()[1]
++
+     def get_metadata(self):
+         return {
+             "get_ar_len": self.ar_len,
+diff --git a/examples/qualcomm/oss_scripts/llama/static_llm_quant_recipe.py b/examples/qualcomm/oss_scripts/llama/static_llm_quant_recipe.py
+index 29eba63..edc2847 100644
+--- a/examples/qualcomm/oss_scripts/llama/static_llm_quant_recipe.py
++++ b/examples/qualcomm/oss_scripts/llama/static_llm_quant_recipe.py
+@@ -13,7 +13,35 @@ from executorch.backends.qualcomm.quantizer.quant_recipe import (
+     QuantRecipe,
+ )
+ from executorch.backends.qualcomm.quantizer.quantizer import QuantDtype
+-from torchao.quantization.pt2e import MinMaxObserver, MovingAverageMinMaxObserver
++from torchao.quantization.pt2e import (
++    HistogramObserver,
++    MinMaxObserver,
++    MovingAverageMinMaxObserver,
++)
++
++
++class MarginMinMaxObserver(MinMaxObserver):
++    """MinMax with headroom, for activations whose deployment range exceeds what calibration saw.
++
++    The DFlash draft's damage was clipping, not rounding: replaying the exported QDQ graph with
++    rounding removed but clipping kept reproduced the whole loss (cosine 0.7866, 0 of 8 argmax),
++    while rounding with clipping removed did not (0.9911, 5 of 8). Only about 0.002% of elements
++    clip, but they are the extremes that decide attention. Widening the range by 2x recovers it
++    (6 of 8); 4x and beyond starts giving the rounding error back.
++
++    This is also why HistogramObserver made the draft worse (1 of 8 -> 0 of 8): it minimises MSE by
++    narrowing the range, which is the wrong direction when the failure is clipping.
++    """
++
++    margin = 2.0
++
++    def calculate_qparams(self):
++        lo, hi = self.min_val, self.max_val
++        try:
++            self.min_val, self.max_val = lo * self.margin, hi * self.margin
++            return super().calculate_qparams()
++        finally:
++            self.min_val, self.max_val = lo, hi
+ 
+ 
+ class StaticLLMQuantRecipe:
+@@ -673,6 +701,422 @@ class Qwen3_1_7BQuantRecipe(StaticLLMQuantRecipe):
+         self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
+ 
+ 
++class Qwen3_4BQuantRecipe(StaticLLMQuantRecipe):
++    # Same architecture family as 1.7B (QK-norm, HF rope, no qkv bias), only wider and deeper,
++    # so the 1.7B recipe carries over unchanged.
++    default_quant_dtype = QuantDtype.use_16a4w
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = (
++            QuantRecipe(
++                self.default_quant_dtype,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_TENSOR,
++                verbose=verbose,
++            )
++            .add_node_target(
++                {
++                    torch.ops.aten.conv2d.default,
++                },
++                QuantDtype.use_16a4w_block,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_BLOCK,
++                extra_kwargs={"block_size": (1, 16, 1, 1)},
++            )
++            .add_regex(
++                {
++                    r"output\.conv",
++                },
++                QuantDtype.use_16a8w,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++        )
++        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
++
++
++class Qwen3_8BQuantRecipe(Qwen3_4BQuantRecipe):
++    pass
++
++
++class Qwen3_4B_SqnrQuantRecipe(StaticLLMQuantRecipe):
++    """Qwen3_4BQuantRecipe plus the mixed-precision upgrades suggested by the SQNR analyzer.
++
++    Produced by `--quant_recipe_suggestion` on the 39-sample Spec-Bench calibration set
++    (see qwen3-4b-kv16_quantization_error.csv), keeping the block-16 LPBQ base so this
++    differs from Qwen3_4BQuantRecipe in exactly one way: 13 layer groups move from 4-bit
++    LPBQ to 8-bit per-channel. Costs ~544 MiB of weights (+18% on the .pte).
++
++    The analyzer's SQNR is measured end-to-end on the fully quantized graph, so error
++    propagates forward and the ranking is confounded with depth -- a deep group scoring
++    low may just sit downstream of a fragile one. Within a depth band the ordering still
++    separates w2/wv/wo from w1/w3/wq/wk, which is why this is worth measuring rather than
++    trusting. Judge it on acceptance length, not on SQNR.
++
++    Keeps annotate_kv_8bit: the 13-category sweep put the 8-bit KV cache ahead of 16-bit
++    (AL 1.955 vs 1.925 at 12% higher tps), and it makes ctx_cal the one-variable control.
++    """
++
++    default_quant_dtype = QuantDtype.use_16a4w
++
++    # Upgraded to 16a8w per-channel. Layer lists are the analyzer's depth buckets
++    # (36 // 5 = 7 layers each, remainder folded into the last).
++    _SENSITIVE = (
++        # every down_proj -- the worst group at every depth
++        (range(0, 36), "feed_forward", "w2"),
++        (range(7, 36), "attention", "wv"),
++        (range(21, 36), "attention", "wo"),
++        (range(7, 14), "feed_forward", "w3"),
++    )
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = QuantRecipe(
++            self.default_quant_dtype,
++            False,
++            act_observer=MinMaxObserver,
++            granularity=QuantGranularity.PER_TENSOR,
++            verbose=verbose,
++        ).add_node_target(
++            {
++                torch.ops.aten.conv2d.default,
++            },
++            QuantDtype.use_16a4w_block,
++            False,
++            act_observer=MinMaxObserver,
++            granularity=QuantGranularity.PER_BLOCK,
++            extra_kwargs={"block_size": (1, 16, 1, 1)},
++        )
++
++        # Strategies are matched last-added-first, so the regexes below override the
++        # blanket conv2d rule above.
++        for layers, submodule, proj in self._SENSITIVE:
++            ids = "|".join(str(i) for i in layers)
++            self.recipe.add_regex(
++                {
++                    rf"layers\.({ids})\.{submodule}\.forward\.__self__\.{proj}_conv",
++                },
++                QuantDtype.use_16a8w,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++                note=f"SqnrAnalyzer: {proj}_conv layers {layers.start}-{layers.stop - 1}",
++            )
++
++        self.recipe.add_regex(
++            {
++                r"output\.conv",
++            },
++            QuantDtype.use_16a8w,
++            False,
++            act_observer=MinMaxObserver,
++            granularity=QuantGranularity.PER_CHANNEL,
++        )
++        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
++
++
++class Qwen3_KV16QuantRecipe(StaticLLMQuantRecipe):
++    """16a4w with a 16-bit KV cache instead of 8-bit.
++
++    Identical to Qwen3_4BQuantRecipe except that annotate_kv_8bit is not applied, which leaves the
++    KV cache at 16 bits (see StaticLLMQuantRecipe.get_kv_io_bit_width).
++
++    Why: the GPU baseline reaches acceptance length 2.79 with 4-bit weights, while this NPU target
++    reaches 1.65. Weight precision is not the difference -- the weight matrices here are 4-bit over
++    blocks of 16, finer than q4_0's blocks of 32, and raising them to 8 bits changed nothing. The KV
++    cache is: llama.cpp keeps it at f16, this recipe stores it as UFIXED_POINT_8. Measured on the
++    exported model the K cache carries scale 0.060, i.e. 256 levels across a span of ~15, so every
++    past key is ~1% noisy. Attention reads the entire context through that, and a target whose
++    attention has drifted disagrees with a draft trained against the bf16 target.
++
++    Costs 2x KV memory (72 -> 144 MiB at 1024 context) and 2x KV bandwidth per verify.
++    """
++    default_quant_dtype = QuantDtype.use_16a4w
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = (
++            QuantRecipe(
++                self.default_quant_dtype,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_TENSOR,
++                verbose=verbose,
++            )
++            .add_node_target(
++                {
++                    torch.ops.aten.conv2d.default,
++                },
++                QuantDtype.use_16a4w_block,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_BLOCK,
++                extra_kwargs={"block_size": (1, 16, 1, 1)},
++            )
++            .add_regex(
++                {
++                    r"output\.conv",
++                },
++                QuantDtype.use_16a8w,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++        )
++        # deliberately no annotate_kv_8bit
++
++
++class Qwen3_KV16HistQuantRecipe(StaticLLMQuantRecipe):
++    """KV16 with histogram-based activation ranges instead of min/max.
++
++    MinMaxObserver takes the extremes it happens to see during calibration, so a handful of outlier
++    activations set the scale and the bulk of the distribution gets a fraction of the range. Measured
++    on the exported model, the inter-shard hidden tensors carry a span of ~20,700 where a real prompt
++    only spans ~5,800 -- 3.5x wider than needed. HistogramObserver picks the range that minimises
++    quantization error over the observed distribution instead, which is the direct fix for that.
++
++    Weights keep their min/max observers; only activations change. Costs calibration time only.
++    """
++    default_quant_dtype = QuantDtype.use_16a4w
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = (
++            QuantRecipe(
++                self.default_quant_dtype,
++                False,
++                act_observer=HistogramObserver,
++                granularity=QuantGranularity.PER_TENSOR,
++                verbose=verbose,
++            )
++            .add_node_target(
++                {
++                    torch.ops.aten.conv2d.default,
++                },
++                QuantDtype.use_16a4w_block,
++                False,
++                act_observer=HistogramObserver,
++                granularity=QuantGranularity.PER_BLOCK,
++                extra_kwargs={"block_size": (1, 16, 1, 1)},
++            )
++            .add_regex(
++                {
++                    r"output\.conv",
++                },
++                QuantDtype.use_16a8w,
++                False,
++                act_observer=HistogramObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++        )
++        # no annotate_kv_8bit: keep the KV cache at 16 bits (see Qwen3_KV16QuantRecipe)
++
++
++class Qwen3_16a8wQuantRecipe(StaticLLMQuantRecipe):
++    """8-bit weights instead of 4-bit, which is the baseline the upstream guide recommends.
++
++    Speculative decoding is more sensitive to target quantization than plain generation: the draft
++    was trained against the bf16 target, and acceptance length measures how closely the target still
++    agrees with it. On Qwen3-4B the 16a4w target gives AL ~1.65 where the GPU q4_0 target gives 2.79,
++    and calibration size was ruled out as the cause, which leaves the 4-bit weights. This recipe
++    trades roughly 2x the .pte size for that.
++
++    The LM head keeps its per-channel treatment -- it drives the logits directly and is the one
++    tensor the guide singles out as worth protecting.
++    """
++    default_quant_dtype = QuantDtype.use_16a8w
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = (
++            QuantRecipe(
++                self.default_quant_dtype,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_TENSOR,
++                verbose=verbose,
++            )
++            .add_node_target(
++                {
++                    torch.ops.aten.conv2d.default,
++                },
++                self.default_quant_dtype,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++            .add_regex(
++                {
++                    r"output\.conv",
++                },
++                QuantDtype.use_16a8w,
++                False,
++                act_observer=MinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++        )
++        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
++
++
++class Qwen3_DFlashDraftQuantRecipe(StaticLLMQuantRecipe):
++    """8-bit weights, histogram activation ranges.
++
++    The activation ranges are too narrow, not too wide. See MarginMinMaxObserver for the evidence.
++
++    Weights are not the problem: per-channel 8-bit fake quantisation alone scores 0.9976 and 6 of 8,
++    and bypassing every per-tensor activation quantiser in the exported graph reproduces exactly
++    that. The loss is clipping on layer 0's attention path, which MarginMinMaxObserver fixes.
++
++    Do not judge this model by cosine on logits. Logit vectors share a large vocabulary-frequency
++    component, so two rows of the same fp32 model that predict different tokens still score 0.68 to
++    0.905, and a moment-matched random vector scores 0.44. Cosine 0.889 sat inside that noise band
++    while top-1 agreement was 1 of 8, which is what acceptance length follows.
++    """
++
++    default_quant_dtype = QuantDtype.use_16a8w
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = (
++            QuantRecipe(
++                self.default_quant_dtype,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_TENSOR,
++                verbose=verbose,
++            )
++            .add_node_target(
++                {
++                    torch.ops.aten.conv2d.default,
++                },
++                self.default_quant_dtype,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++            .add_regex(
++                {
++                    r"output\.conv",
++                },
++                QuantDtype.use_16a8w,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++        )
++        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
++
++
++class Qwen3_DFlashDraftW4A16QuantRecipe(StaticLLMQuantRecipe):
++    """4-bit weights, 16-bit activations, same range margin as the 8-bit recipe.
++
++    Structurally the target's recipe -- per-block 4-bit on the linears, per-channel 8-bit on the LM
++    head -- with MarginMinMaxObserver on the activations, which is the part that actually decided
++    this model's accuracy. The earlier 4-bit attempt scored 0 of 8 and was read as "five layers
++    cannot take 4 bits"; that was measured with the narrow ranges, so it says nothing about the
++    weight width. Halving the weights halves the per-call cost, which on this NPU is weight
++    streaming at ~18 ms/GB, so it is worth re-testing on its own terms.
++
++    `fc` gets no special protection here. It was suspected of being the weak point and was cleared:
++    bypassing the whole h -> fc -> hidden_norm chain in the exported graph changed nothing
++    (0.7903 -> 0.7835), while bypassing layer 0's attention path recovered the model outright.
++    """
++
++    default_quant_dtype = QuantDtype.use_16a4w
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = (
++            QuantRecipe(
++                self.default_quant_dtype,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_TENSOR,
++                verbose=verbose,
++            )
++            .add_node_target(
++                {
++                    torch.ops.aten.conv2d.default,
++                },
++                QuantDtype.use_16a4w_block,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_BLOCK,
++                extra_kwargs={"block_size": (1, 16, 1, 1)},
++            )
++            .add_regex(
++                {
++                    r"output\.conv",
++                },
++                QuantDtype.use_16a8w,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++        )
++        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
++
++
++class Qwen3_DFlashDraftW4A8QuantRecipe(StaticLLMQuantRecipe):
++    """4-bit weights, 8-bit activations.
++
++    The point of this one is to price the activation width, since w4a16 turned out to cost nothing
++    in acceptance (device AL 2.73 vs 2.64 for w8a16) while shrinking the context 14%. Dropping the
++    activations to 8 bits is the only remaining knob that touches the quantised tensors themselves.
++
++    Two things are forced here. QUANT_CONFIG_DICT has no per-block entry for use_8a4w, so the
++    linears take per-channel 4-bit rather than the per-block-16 that w4a16 uses -- and per-channel
++    is the weaker of the two on this model (weight-only ceiling 0.6329 against 0.8426). And the
++    range margin now costs a full bit out of eight rather than one out of sixteen, so if this
++    configuration loses, the margin is the first thing to re-tune, not the last.
++    """
++
++    default_quant_dtype = QuantDtype.use_8a4w
++
++    def __init__(self, verbose: bool = False):
++        super().__init__()
++
++        self.recipe = (
++            QuantRecipe(
++                self.default_quant_dtype,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_TENSOR,
++                verbose=verbose,
++            )
++            .add_node_target(
++                {
++                    torch.ops.aten.conv2d.default,
++                },
++                self.default_quant_dtype,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++            .add_regex(
++                {
++                    r"output\.conv",
++                },
++                QuantDtype.use_8a8w,
++                False,
++                act_observer=MarginMinMaxObserver,
++                granularity=QuantGranularity.PER_CHANNEL,
++            )
++        )
++        self.recipe.custom_quant_annotations.append(annotate_kv_8bit)
++
++
+ class Smollm2QuantRecipe(StaticLLMQuantRecipe):
+     default_quant_dtype = QuantDtype.use_16a8w
+ 
+diff --git a/examples/qualcomm/oss_scripts/llama/tokenizer.py b/examples/qualcomm/oss_scripts/llama/tokenizer.py
+index 653b270..96d45d3 100644
+--- a/examples/qualcomm/oss_scripts/llama/tokenizer.py
++++ b/examples/qualcomm/oss_scripts/llama/tokenizer.py
+@@ -66,7 +66,9 @@ class TokenizerWrapper:
+ 
+         self.control_args = control_args
+         self.config = config
+-        self.repo_id = config.repo_id
++        # A speculative-decoding draft head ships no tokenizer -- it shares the target's vocabulary
++        # and its repo holds weights only. tokenizer_repo_id points at whoever owns the vocabulary.
++        self.repo_id = getattr(config, "tokenizer_repo_id", None) or config.repo_id
+         self._instruct_model = config.instruct_model
+ 
+         self.tokenizer = None
+diff --git a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
+index 1fc0816..cdec4e2 100644
+--- a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
++++ b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
+@@ -25,6 +25,7 @@ from executorch.backends.qualcomm.utils.check_qnn_version import (
+ )
+ from executorch.examples.qualcomm.oss_scripts.llama import LLMModelConfig
+ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
++    draft_calibrate_ar_len,
+     AUDIO_ENCODER,
+     VISION_ENCODER,
+ )
+@@ -103,6 +104,10 @@ def process_model_args(
+         ar_len = control_args.prefill_ar_len
+     elif mode == Mode.CALIBRATE:
+         ar_len = control_args.max_context_len
++        # A draft head spends part of its window on the committed rows that ride along with each
++        # block, and needs what is left over to hold a real KV cache while calibrating.
++        if getattr(config, "n_inject", None):
++            ar_len = draft_calibrate_ar_len(control_args.max_context_len, config.n_inject)
+     else:
+         raise ValueError(f"Unsupported mode: {mode}")
+ 
+@@ -147,6 +152,12 @@ def get_model_specific_kwargs(control_args: argparse.Namespace, config: LLMModel
+     if hasattr(config, VISION_ENCODER):
+         hf_config = AutoConfig.from_pretrained(config.repo_id)
+         kwargs["image_token_id"] = hf_config.image_token_id
++    # A speculative-decoding draft head needs two shape parameters that no ordinary decoder has:
++    # how many committed rows travel with each block (n_inject) and how many target layers were
++    # concatenated to form its input (n_target_layers). Both are fixed at export time.
++    for attr in ("n_inject", "n_target_layers"):
++        if hasattr(config, attr):
++            kwargs[attr] = getattr(config, attr)
+     return kwargs
+ 
+ 
+diff --git a/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py b/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+index 264f8b7..453704d 100644
+--- a/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
++++ b/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+@@ -5,6 +5,7 @@
+ # LICENSE file in the root directory of this source tree.
+ import argparse
+ import copy
++import ctypes
+ import gc
+ import inspect
+ import json
+@@ -54,6 +55,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.decoder_constants import (
+     AUDIO_ENCODER,
+     DECODE_QDQ_FILENAME,
+     DECODER_GRAPH_NAMES,
++    SQNR_EVAL,
+     TEXT_DECODER,
+     TEXT_ENCODER,
+     TOK_EMBEDDING,
+@@ -71,6 +73,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.evaluator.lm_eval_adapter im
+ )
+ from executorch.examples.qualcomm.oss_scripts.llama.inference import (
+     DecoderInference,
++    DFlashDecoderInference,
+     EncoderInference,
+ )
+ from executorch.examples.qualcomm.oss_scripts.llama.mix_precision_analyzer import (
+@@ -154,6 +157,10 @@ def is_node_src_start_with_name(node: torch.fx.Node, kv_cache_prefix: str) -> bo
+ 
+ class TextDecoder(Component):
+ 
++    # One fp32 weight set shared by the DECODE / PREFILL / CALIBRATE instances of a hybrid export.
++    # Class-level: a process exports one model, and the cache is keyed by nothing else.
++    _shared_fp32_weights = None
++
+     def __init__(
+         self,
+         control_args: argparse.Namespace,
+@@ -236,23 +243,51 @@ class TextDecoder(Component):
+                 shares=self.config.num_sharding,
+                 pattern=self._get_sharding_get_pattern(),
+                 layer_prefix_offsets=layer_prefix_offsets,
++                shard_layers=getattr(self.config, "shard_layers", None),
+             )
+             self.passes_job[SplitGraph] = setting
+             self.dep_table[SplitGraph] = [FoldQDQ]
+             self.dep_table[TagQuantIO] = [SplitGraph]
+ 
+-        self._decoder_inference = (
+-            DecoderInference(
++        # A DFlash draft head takes seven graph inputs, and two of them are the target's hidden
++        # states, which this loop cannot produce -- the target is not the model being exported.
++        # They are replayed from an offline dump instead.
++        n_inject = getattr(self.config, "n_inject", None)
++        if self.decoder is not None and n_inject is not None:
++            dump = getattr(self.control_args, "dflash_hidden", None)
++            if not dump:
++                raise ValueError(
++                    "a DFlash draft export needs --dflash_hidden: the target hidden states its "
++                    "observers calibrate on cannot come from token prompts. Produce one with "
++                    "dump_target_hidden.py against the TARGET model."
++                )
++            self._decoder_inference = DFlashDecoderInference(
+                 get_example_inputs=self.get_example_inputs,
+-                audio_token_id=self.meta.get("audio_token_id", None),
+-                image_token_id=self.meta.get("image_token_id", None),
++                hidden_dump=dump,
++                n_inject=n_inject,
++                n_target_layers=getattr(self.config, "n_target_layers", 5),
++                mask_token_id=getattr(self.config, "mask_token_id", None),
++                # The table is no longer a graph input, so calibration has to do the lookup the
++                # runtime does on the host. It stays reachable on the module; forward not touching
++                # it is what keeps it out of the artifact.
++                embedding=getattr(self.decoder, "tok_embeddings", None),
+                 max_context_len=self.meta["get_max_context_len"],
+                 max_batch_size=self.meta["get_max_batch_size"],
+                 use_i64_token=self.control_args.embedding_quantize is not None,
+             )
+-            if self.decoder is not None
+-            else None
+-        )
++        else:
++            self._decoder_inference = (
++                DecoderInference(
++                    get_example_inputs=self.get_example_inputs,
++                    audio_token_id=self.meta.get("audio_token_id", None),
++                    image_token_id=self.meta.get("image_token_id", None),
++                    max_context_len=self.meta["get_max_context_len"],
++                    max_batch_size=self.meta["get_max_batch_size"],
++                    use_i64_token=self.control_args.embedding_quantize is not None,
++                )
++                if self.decoder is not None
++                else None
++            )
+ 
+     def _get_sharding_get_pattern(self):
+         if self.control_args.decoder_model == "gemma4-e2b":
+@@ -358,9 +393,36 @@ class TextDecoder(Component):
+         decoder.load_state_dict(state_dict, strict=True, assign=True)
+ 
+         if any([self.config.r1, self.config.r2]):
+-            raise RuntimeError(
+-                "SpinQuant (r1/r2) is no longer supported: the "
+-                "torchao.prototype.spinquant module has been deleted."
++            # torchao.prototype.spinquant is alive and importable; the previous claim here that it
++            # had been deleted was wrong. It has to run now, while wq/wk/wv/wo and w1/w2/w3 are
++            # still nn.Linear -- the conv swap below deletes those attributes outright.
++            #
++            # R2 is a per-head rotation of V paired with its inverse on O, so the attention block's
++            # output is algebraically unchanged and the residual stream (and with it the shard
++            # boundary hidden states the DFlash draft reads) is untouched. Only the V-cache wire
++            # format changes, which is the point: it is what the 8-bit KV quantizer sees.
++            #
++            # R1 is NOT a free basis change here -- torchao mean-subtracts the embedding, which
++            # flips ~10% of greedy argmaxes in fp32 and makes the rotation impossible to undo at
++            # the DFlash capture points. Leave r1 off unless that mean-subtraction goes too.
++            from torchao.prototype.spinquant import apply_spinquant
++
++            assert (
++                self.model_args is not None
++            ), "spinquant needs ModelArgs to stand in for the missing decoder.config"
++            assert (
++                self.model_args.use_ffn_norm
++            ), "spinquant folds ffn_norm into w1/w3; a None norm would crash the fusion"
++            # LlamaModel never sets .config, but spinquant only reads .dim / .head_dim off it.
++            decoder.config = self.model_args
++            apply_spinquant(
++                decoder,
++                use_r1=self.config.r1,
++                use_r2=self.config.r2,
++                # wqkv does not exist -- the projections are separate modules.
++                qkv_split=True,
++                # R4 would need a Hadamard of order hidden_dim; 9728 has none.
++                use_r4=False,
+             )
+ 
+         # perform model transformation
+@@ -377,6 +439,46 @@ class TextDecoder(Component):
+             dtype_override = DType[self.control_args.dtype_override]
+             decoder = decoder.to(dtype_override.to_torch_dtype())
+ 
++        # A hybrid export builds three of these -- DECODE, PREFILL and CALIBRATE -- and they differ
++        # only in ar_len, batch size and masks (base_component.py sets nothing else per mode). Each
++        # was nonetheless materialising its own fp32 copy at the .to() above, so the working set was
++        # three times the model before a single node had been lowered: measured 94 GiB of an 8B
++        # export's 97 GiB plateau, and the reason the 8B export never survived convert_pt2e.
++        #
++        # Point every later instance at the first one's tensors instead. Their weight VALUES cannot
++        # reach the artifact independently anyway -- _encoding_override re-points decode's and
++        # prefill's get_attr targets at calibration_prefill's tensors -- so this only removes copies
++        # that were going to be discarded.
++        #
++        # Only safe while nothing rewrites weights per instance. Each of these does:
++        #   r1/r2  spinquant rotates the weights in place, and would be applied three times
++        #   seq_mse  searches per-instance scales and writes them back
++        #   qat      trains
++        can_share = (
++            not self.config.r1
++            and not self.config.r2
++            and not getattr(self.config, "seq_mse_candidates", 0)
++            and not getattr(self.control_args, "qat", False)
++        )
++        if can_share:
++            shared = type(self)._shared_fp32_weights
++            if shared is None:
++                type(self)._shared_fp32_weights = dict(decoder.state_dict())
++                logging.info(f"[{self.mode}] cached fp32 weights for later instances")
++            elif set(shared) == set(decoder.state_dict()):
++                decoder.load_state_dict(shared, strict=True, assign=True)
++                gc.collect()
++                try:
++                    ctypes.CDLL("libc.so.6").malloc_trim(0)
++                except OSError:
++                    pass
++                logging.info(f"[{self.mode}] reusing the cached fp32 weights")
++            else:
++                logging.warning(
++                    f"[{self.mode}] parameter names differ from the cached instance; "
++                    "keeping a private copy"
++                )
++
+         # check embedding fallback
+         if self.control_args.embedding_quantize:
+             self.passes_job[I64toI32][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
+@@ -467,13 +569,25 @@ class TextDecoder(Component):
+         # get example input
+         self.example_input = decoder.get_example_inputs()
+         self.get_example_inputs = decoder.get_example_inputs
+-        self.export_input = (
+-            self.example_input[0],  # tokens or hidden_states
+-            *self.example_input[1],  # attn_mask
+-            *((self.example_input[2],) if decoder.use_kv_cache else []),  # pos_ids
+-            *(self.example_input[3] if decoder.use_kv_cache else []),  # k_caches
+-            *(self.example_input[4] if decoder.use_kv_cache else []),  # v_caches
+-        )
++        if getattr(decoder, "n_target_layers", None):
++            # DFlash draft: (target_hidden list, tokens, attn_mask, pos, pos_ctx, k list, v list)
++            self.export_input = (
++                *self.example_input[0],   # one hidden tensor per target layer
++                self.example_input[1],    # block tokens
++                *self.example_input[2],   # attn_mask
++                self.example_input[3],    # block positions
++                self.example_input[4],    # committed-row positions
++                *self.example_input[5],   # k_caches
++                *self.example_input[6],   # v_caches
++            )
++        else:
++            self.export_input = (
++                self.example_input[0],  # tokens or hidden_states
++                *self.example_input[1],  # attn_mask
++                *((self.example_input[2],) if decoder.use_kv_cache else []),  # pos_ids
++                *(self.example_input[3] if decoder.use_kv_cache else []),  # k_caches
++                *(self.example_input[4] if decoder.use_kv_cache else []),  # v_caches
++            )
+         self.io_shape = {
+             # logit output
+             (
+@@ -515,6 +629,10 @@ class TextDecoder(Component):
+     @property
+     def attn_mask(self):
+         """Attention mask for this decoder graph, used as a schema for dataset construction."""
++        # Position 1 holds the mask for every decoder whose first input is the token tensor. A
++        # DFlash draft puts one hidden tensor per target layer in front, so its mask sits at 2.
++        if getattr(self.config, "n_target_layers", None):
++            return self.example_input[2]
+         return self.example_input[1]
+ 
+     def _save_logits_quant_attrs(self):
+@@ -823,6 +941,48 @@ class TextDecoder(Component):
+             del graph_module
+             gc.collect()
+ 
++            # convert_pt2e folds each weight into a new int8 `_frozen_paramN` buffer and then tries
++            # to delete the fp32 original, but the guard it uses is
++            # `if hasattr(gm, node.target)` (torchao/quantization/pt2e/constant_fold.py:354) and
++            # after ExportedProgram.module() the get_attr targets are dotted FQNs like
++            # "layers.0.attention.wq_conv.weight". hasattr() on a dotted name is False, so delattr
++            # never runs and every graph carries fp32 AND int8 from here until write_to_file.
++            #
++            # That is the whole story of this export's memory: three decoders x one dead fp32 model
++            # each. Peak RSS measured 102 GiB for a 4B model whose weights are 16.4 GiB.
++            #
++            # Dropping them is artifact-neutral by construction -- they have no get_attr user, and
++            # exir's remove_unused_parameters_pass strips them from the state dict at to_edge time
++            # regardless, so the .pte never saw them.
++            live = {n.target for n in self.decoder.graph.nodes if n.op == "get_attr"}
++            freed = 0
++            for fqn, tensor in list(self.decoder.named_parameters()) + list(
++                self.decoder.named_buffers()
++            ):
++                if fqn in live:
++                    continue
++                atoms = fqn.split(".")
++                owner = self.decoder
++                for atom in atoms[:-1]:
++                    owner = getattr(owner, atom)
++                delattr(owner, atoms[-1])
++                freed += tensor.numel() * tensor.element_size()
++            gc.collect()
++
++            # Freeing the objects is not enough. PyTorch's CPU allocator goes through
++            # posix_memalign, and glibc keeps freed arenas rather than returning them, so RSS stays
++            # flat while the pages sit unused. The watchdog and the OOM killer both look at RSS, so
++            # a purge that does not trim buys nothing at the moment it matters -- measured: three
++            # purges of 16.44 GiB each left the peak at 101.8 GiB against a 102.0 GiB baseline.
++            try:
++                ctypes.CDLL("libc.so.6").malloc_trim(0)
++            except OSError:  # not glibc
++                pass
++
++            logging.info(
++                f"[{self.mode}] purged {freed / 2**30:.2f} GiB of folded-away fp32 constants"
++            )
++
+             if self.apply_embedding:
+                 self.tok_embedding = convert_pt2e(self.tok_embedding)
+ 
+@@ -1098,15 +1258,25 @@ class HybridTextDecoder(Component):
+                     override_kv_cache=False,
+                 )
+ 
+-            # Saving Decode QDQ Model EP for SQNR evaluation
+-            qdq_ep = torch.export.export(
+-                self.calibration_prefill.decoder,
+-                self.calibration_prefill.export_input,
+-                strict=True,
+-            )
+-            qdq_ep_path = f"{self.decode.control_args.artifact}/{DECODE_QDQ_FILENAME}"
+-            torch.export.save(qdq_ep, qdq_ep_path)
+-            logging.info(f"QDQ EP saved to {qdq_ep_path}")
++            # Saving Decode QDQ Model EP for SQNR evaluation.
++            #
++            # Only SQNR eval reads this file, and it is 22.8 GiB for a 4B model. Writing it
++            # unconditionally also defeats the `del self.calibration_prefill` below, because the
++            # local `qdq_ep` pins that decoder's whole graph through lowering -- the phase where
++            # this export runs out of memory. Skip it unless something is going to read it.
++            if SQNR_EVAL in (
++                getattr(self.decode.control_args, "eval_methods", None) or []
++            ):
++                qdq_ep = torch.export.export(
++                    self.calibration_prefill.decoder,
++                    self.calibration_prefill.export_input,
++                    strict=True,
++                )
++                qdq_ep_path = f"{self.decode.control_args.artifact}/{DECODE_QDQ_FILENAME}"
++                torch.export.save(qdq_ep, qdq_ep_path)
++                logging.info(f"QDQ EP saved to {qdq_ep_path}")
++                del qdq_ep
++                gc.collect()
+ 
+             if self.apply_embedding:
+                 self._encoding_override(
+@@ -1327,6 +1497,7 @@ class Modality(Component):
+                 self.num_layers,
+                 shares=self.config.num_sharding,
+                 pattern=self._get_sharding_get_pattern(),
++                shard_layers=getattr(self.config, "shard_layers", None),
+             )
+             self.passes_job[SplitGraph] = setting
+             self.dep_table[SplitGraph] = [FoldQDQ]
+diff --git a/extension/llm/custom_ops/model_sharding.py b/extension/llm/custom_ops/model_sharding.py
+index b744a17..ee052b2 100644
+--- a/extension/llm/custom_ops/model_sharding.py
++++ b/extension/llm/custom_ops/model_sharding.py
+@@ -119,8 +119,14 @@ def get_split_graph_pass(
+     shares: int,
+     pattern=r"layers\.(\d+)",
+     layer_prefix_offsets: dict = None,
++    shard_layers: List[int] = None,
+ ):
+-    shard_layers = list(range(0, num_layers, int(num_layers / shares)))
++    # An explicit shard_layers overrides the even split. Speculative decoding needs this: a DFlash
++    # draft is trained against specific target layers, so the partition boundaries have to land on
++    # those layers to expose their hidden states as inter-shard tensors. For Qwen3-4B/8B that is
++    # [2, 10, 18, 26, 34] -- an uneven 2/8/8/8/8/2 split that range() cannot express.
++    if shard_layers is None:
++        shard_layers = list(range(0, num_layers, int(num_layers / shares)))
+     kwargs = {"shard_layers": shard_layers, "pattern": pattern}
+     if layer_prefix_offsets:
+         kwargs["layer_prefix_offsets"] = layer_prefix_offsets

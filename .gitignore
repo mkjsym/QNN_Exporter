@@ -1,0 +1,6 @@
+env.sh
+__pycache__/
+*.pyc
+*.pte
+*.bin
+*.pt

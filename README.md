@@ -14,7 +14,7 @@ reference numbers were measured with.
 patch/     the ExecuTorch patch + apply.sh
 scripts/   export / extract / params / embedding-dump drivers
 data/      calibration prompts (39 chat-templated Spec-Bench samples)
-docs/      full export guide, quantization rationale, peak-memory notes
+docs/      full export guide, patch notes, quantization rationale, peak-memory notes
 ```
 
 ---
@@ -134,6 +134,15 @@ must equal the AR output token for token.
 | DFlash-4B draft | `16a8w` per-channel + margin ×2 | ~6 min | — | 1.6 GB | 1.6 GB |
 | DSpark-b7 draft | same, embedding-free | ~6 min | — | 894 MB | 894 MB |
 | DFlash-4B w4a16 | `16a4w` per-block-16 + margin ×2 | ~6 min | — | 1.4 GB | 1.4 GB |
+
+## Docs
+
+| | |
+|---|---|
+| [docs/export-guide.md](docs/export-guide.md) | checkpoint → device, every step and what it does |
+| [docs/patch-notes.md](docs/patch-notes.md) | what the ExecuTorch patch changes, and what was deliberately left out |
+| [docs/quantization.md](docs/quantization.md) | why these recipes; every draft setting tried |
+| [docs/peak-memory.md](docs/peak-memory.md) | why an 8B export needs 127 GiB and how it got there from 154 |
 
 ## Why these recipes
 

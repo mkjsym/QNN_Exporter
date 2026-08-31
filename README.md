@@ -72,8 +72,11 @@ python $EXECUTORCH_ROOT/examples/qualcomm/oss_scripts/llama/dump_target_hidden.p
 ./scripts/export_draft.sh qwen3-4b-dflash /work/art_dflash /work/hidden_4b.pt
 ./scripts/extract_context.sh /work/art_dflash /work/ctx_dflash 1
 ./scripts/make_params.py --hf Qwen/Qwen3-4B --out /work/ctx_dflash/params.json --draft --n-layers 5
-./scripts/dump_draft_embd.py <draft-checkpoint> /work/draft4b_embd_f16.bin
+./scripts/dump_draft_embd.py --ckpt dflash4b.pth --out /work/draft4b_embd_f16.bin
 ```
+
+Before paying for an export, `scripts/sweep_draft_bits.py --ckpt … --hidden …` fake-quantizes the
+weights at 4/5/6/8 bits in seconds. It sees weights only, so read it as an upper bound.
 
 Registered drafts: `qwen3-4b-dflash` (deployed, 16a8w), `qwen3-4b-dflash-w4` (w4a16),
 `qwen3-4b-dflash-w4a8`, `qwen3-4b-dspark` (DSpark-b7, needed by PCTree/DARTree), `qwen3-8b-dflash`.

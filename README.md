@@ -146,6 +146,7 @@ on this device; AL does not move, and rank order is stable in both.
 
 | | |
 |---|---|
+| [docs/reproducing-acceptance.md](docs/reproducing-acceptance.md) | **start here if your AL does not match** — bake to CLI, with a symptom table |
 | [docs/export-guide.md](docs/export-guide.md) | checkpoint → device, every step and what it does |
 | [docs/patch-notes.md](docs/patch-notes.md) | what the ExecuTorch patch changes, and what was deliberately left out |
 | [docs/quantization.md](docs/quantization.md) | why these recipes; every draft setting tried |

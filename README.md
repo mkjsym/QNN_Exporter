@@ -107,17 +107,21 @@ Galaxy S26 (Snapdragon 8 Elite Gen 5), Spec-Bench 13 categories, `-n 128`, greed
 (4B: 17.55 t/s). These are cross-checked against a token-identity gate — the speculative output
 must equal the AR output token for token.
 
-**Qwen3-4B target (`qwen3-4b-sqnr`, ar_len 32) + NPU draft**
+**Qwen3-4B target (`qwen3-4b-sqnr`, ar_len 32) + NPU draft**, two independent sessions — acceptance
+reproduces to the digit, throughput does not, so `×AR` is quoted from both.
 
-| technique | draft context | AL | draft ms | verify ms | t/s | ×AR |
+| technique | draft context | AL | t/s (A) | ×AR (AR 17.55) | t/s (B) | ×AR (AR 18.53) |
 |---|---|---:|---:|---:|---:|---:|
-| PCTree | `qwen3-4b-dspark` | 4.77 | 18.9 | 60.3 | 60.0 | **3.42** |
-| DARTree | `qwen3-4b-dspark` | 4.67 | 17.9 | 60.4 | 59.4 | 3.39 |
-| TileMenu | `qwen3-4b-dflash` | 4.28 | 17.9 | 56.9 | 57.1 | 3.25 |
-| DDTree | `qwen3-4b-dflash` | 4.13 | 18.2 | 60.0 | 52.6 | 3.00 |
-| DSpark | `qwen3-4b-dspark` | 3.76 | 16.8 | 55.7 | 51.8 | 2.95 |
-| DFlash | `qwen3-4b-dflash` | 3.46 | 16.6 | 55.8 | 47.6 | 2.71 |
-| *AR* | — | — | — | — | *17.55* | *1.00* |
+| PCTree | `qwen3-4b-dspark` | 4.77 / 4.64 | 60.0 | **3.42** | 56.0 | **3.02** |
+| DARTree | `qwen3-4b-dspark` | 4.67 | 59.4 | 3.39 | 55.6 | 3.00 |
+| TileMenu | `qwen3-4b-dflash` | 4.28 | 57.1 | 3.25 | 52.4 | 2.83 |
+| DDTree | `qwen3-4b-dflash` | 4.13 / 4.02 | 52.6 | 3.00 | 49.5 | 2.67 |
+| DSpark | `qwen3-4b-dspark` | 3.76 | 51.8 | 2.95 | 48.5 | 2.61 |
+| DFlash | `qwen3-4b-dflash` | 3.46 | 47.6 | 2.71 | 45.2 | 2.44 |
+
+Session B is the more controlled run (one draft backend per boot session). Step time moved ~7% one
+way between sessions while the AR baseline moved 5.6% the other, so `×AR` carries roughly ±0.2–0.4
+on this device; AL does not move, and rank order is stable in both.
 
 **Qwen3-8B target (`qwen3-8b`, ar_len 32) + DFlash-b7 draft**, 4 categories
 
@@ -142,6 +146,7 @@ must equal the AR output token for token.
 
 | | |
 |---|---|
+| [docs/reproducing-acceptance.md](docs/reproducing-acceptance.md) | **start here if your AL does not match** — bake to CLI, with a symptom table |
 | [docs/export-guide.md](docs/export-guide.md) | checkpoint → device, every step and what it does |
 | [docs/patch-notes.md](docs/patch-notes.md) | what the ExecuTorch patch changes, and what was deliberately left out |
 | [docs/quantization.md](docs/quantization.md) | why these recipes; every draft setting tried |

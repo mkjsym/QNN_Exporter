@@ -79,7 +79,12 @@ Before paying for an export, `scripts/sweep_draft_bits.py --ckpt … --hidden �
 weights at 4/5/6/8 bits in seconds. It sees weights only, so read it as an upper bound.
 
 Registered drafts: `qwen3-4b-dflash` (deployed, 16a8w), `qwen3-4b-dflash-w4` (w4a16),
-`qwen3-4b-dflash-w4a8`, `qwen3-4b-dspark` (DSpark-b7, needed by PCTree/DARTree), `qwen3-8b-dflash`.
+`qwen3-4b-dflash-w4a8`, `qwen3-4b-dspark` (DSpark-b7, needed by PCTree/DARTree),
+`qwen3-4b-dspark-w4`, `qwen3-8b-dflash`.
+
+The w4 variants are worth a look: on the DFlash chain, 4-bit weights cost 2.8% acceptance
+and make the draft call 23% cheaper, for +2.0% throughput and a context 25% smaller
+(894 → 671 MB). Whether that still nets out on trees is being measured.
 
 The embedding table is deliberately outside the graph: fp16 on the host, mmapped, 8 rows touched
 per step. Reusing the target GGUF's Q4_0 table instead costs 5 of 8 top-1 agreements.

@@ -5,25 +5,31 @@
 
 ---
 
-## 배포 설정
+## 배포 설정 (2026-09-03 — 드래프트 4비트로 전환)
 
-| | **타깃** Qwen3-4B (`qwen3-4b-sqnr`, 6샤드) | **드래프트** DFlash/DSpark-b7 (비샤딩) |
+| | **타깃** Qwen3-4B/8B | **드래프트** DFlash/DSpark-b7 |
 |---|---|---|
-| 레시피 클래스 | `Qwen3_4B_SqnrQuantRecipe` | `Qwen3_DFlashDraftQuantRecipe` |
-| 기본 dtype | `use_16a4w` | `use_16a8w` |
+| 레시피 클래스 | `Qwen3_4B_SqnrQuantRecipe` / `Qwen3_8BQuantRecipe` | **`Qwen3_DFlashDraftW4A16QuantRecipe`** |
+| 기본 dtype | `use_16a4w` | **`use_16a4w`** (이전 `use_16a8w`) |
 | 활성 | 16비트 per-tensor | 16비트 per-tensor |
 | 관찰자 | `MinMaxObserver` | **`MarginMinMaxObserver` (min/max ×2)** |
-| 가중치 (기본) | **4비트 per-block-16** (LPBQ) | **8비트 per-channel** |
-| 가중치 (승격) | 13개 층 그룹 → 8비트 per-channel | 없음 |
+| 가중치 | **4비트 per-block-16** (LPBQ) + 13그룹 8비트 승격 | **4비트 per-block-16** (이전 8비트 per-channel) |
 | LM 헤드 | 8비트 per-channel | 8비트 per-channel |
-| KV 캐시 | 8비트 (`annotate_kv_8bit`) | 8비트 |
+| KV 캐시 | 8비트 | 8비트 |
 | 토큰 임베딩 | 그래프 내부 | **그래프 밖 · 호스트 fp16 mmap** |
 | 회전 | R3 (Q·K Hadamard) | 동일 |
 | `prefill_ar_len` | 32 | 8 (블록), `n_inject` 16 |
+| 컨텍스트 | 4B 3.6 GB · 8B 5.5 GB | **4B 671 MB · 8B 1.2 GB** |
 
-타깃의 8비트 승격 그룹(SQNR 분석기 제안): `w2` 전 층(0–35), `wv` 7–35, `wo` 21–35, `w3` 7–13.
-가중치 +544 MiB(`.pte` +18%).
+등록명: `qwen3-4b-dflash-w4` · `qwen3-4b-dspark-w4` · `qwen3-8b-dflash-w4` · `qwen3-8b-dspark-w4`.
 
+**4B에서는 최적화, 8B에서는 필수조건이다.** 4B는 수용 1.4~2.8%를 내주고 드래프트 호출 20~24%를
+얻어 순 +2.0~+3.6%. 8B는 8비트 드래프트가 5.5 GB 타깃 옆에서 적재되지 않고 기기를 재부팅시킨다.
+
+타깃의 8비트 승격 그룹: `w2` 전 층(0–35), `wv` 7–35, `wo` 21–35, `w3` 7–13 (+544 MiB).
+**타깃 레시피는 바뀌지 않았다.**
+
+---
 ---
 
 ## 1. 드래프트가 고장났던 이유는 클리핑이다

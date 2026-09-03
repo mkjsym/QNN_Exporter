@@ -184,7 +184,7 @@ index 0000000..c4be875
 +if __name__ == "__main__":
 +    main()
 diff --git a/examples/qualcomm/oss_scripts/llama/__init__.py b/examples/qualcomm/oss_scripts/llama/__init__.py
-index 4e2b051..8b0759c 100644
+index 4e2b051..599d604 100644
 --- a/examples/qualcomm/oss_scripts/llama/__init__.py
 +++ b/examples/qualcomm/oss_scripts/llama/__init__.py
 @@ -9,7 +9,11 @@ from abc import ABC
@@ -216,7 +216,7 @@ index 4e2b051..8b0759c 100644
      Smollm2QATQuantRecipe,
      Smollm2QuantRecipe,
      Smollm3QuantRecipe,
-@@ -99,7 +112,16 @@ from tabulate import tabulate
+@@ -99,7 +112,19 @@ from tabulate import tabulate
  BASE_DIR = os.path.dirname(__file__)
  
  
@@ -229,11 +229,14 @@ index 4e2b051..8b0759c 100644
 +    "qwen3-4b-dflash-w4": DFlashDraftModel,
 +    "qwen3-4b-dflash-w4a8": DFlashDraftModel,
 +    "qwen3-4b-dspark": DFlashDraftModel,
++    "qwen3-4b-dspark-w4": DFlashDraftModel,
 +    "qwen3-8b-dflash": DFlashDraftModel,
++    "qwen3-8b-dflash-w4": DFlashDraftModel,
++    "qwen3-8b-dspark-w4": DFlashDraftModel,
      "gemma3-1b": MultiScopeAwareLlamaModel,
      "granite_speech_3_3-2b": LlamaModelWithoutEmbedding,
      "smolvlm_500m_instruct": LlamaModelWithoutEmbedding,
-@@ -121,6 +143,10 @@ class LLMModelConfig(ABC):
+@@ -121,6 +146,10 @@ class LLMModelConfig(ABC):
      transform_weight: Set to true to change Hugging Face weight to improve the performance of RoPE in HTP backend.
      instruct_model: True if the model uses chat templates. Check Hugging Face model card to ensure the model uses chat templates.
      num_sharding: Specify the number of splits by inserting the fallback custom op. The graph will be split evenly by layers.
@@ -244,7 +247,7 @@ index 4e2b051..8b0759c 100644
      masked_softmax: The MaskedSoftmax feature is designed to optimize the LLMs accuracy and performance executed on HTP backend.
                      MaskedSoftmax is used to replace the Softmax(Add(In, Mask)) structure in attention block in LLMs during backend optimization.
                      For more details, please refer to QNN documents. Note that it is only supported starting from QNN 2.35.
-@@ -149,6 +175,12 @@ class LLMModelConfig(ABC):
+@@ -149,6 +178,12 @@ class LLMModelConfig(ABC):
      r3: bool
      quant_recipe: StaticLLMQuantRecipe
      qat_recipe: Optional[Type[StaticLLMQuantRecipe]] = None
@@ -257,7 +260,7 @@ index 4e2b051..8b0759c 100644
  
      def __str__(self):  # noqa: C901
          """
-@@ -173,7 +205,9 @@ class LLMModelConfig(ABC):
+@@ -173,7 +208,9 @@ class LLMModelConfig(ABC):
              elif isinstance(v, Enum):
                  return f"{v.__class__.__name__}.{v.name}"
              elif isinstance(v, (tuple, list)):
@@ -268,7 +271,7 @@ index 4e2b051..8b0759c 100644
              elif isinstance(v, (str, int, float, bool)):
                  return v
              else:
-@@ -532,6 +566,385 @@ class Qwen3_1_7B(LLMModelConfig):
+@@ -532,6 +569,478 @@ class Qwen3_1_7B(LLMModelConfig):
      quant_recipe = Qwen3_1_7BQuantRecipe
  
  
@@ -614,6 +617,37 @@ index 4e2b051..8b0759c 100644
 +    tokenizer_repo_id = "Qwen/Qwen3-4B"
 +
 +
++@register_llm_model("qwen3-4b-dspark-w4")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_DSpark_W4(LLMModelConfig):
++    """Qwen3_4B_DSpark with 4-bit weights.
++
++    The same trade the DFlash chain was measured on: 4-bit weights cost 2.8% acceptance and buy a
++    23% cheaper draft call, for +2.0% throughput. This entry exists to find out whether that still
++    nets out on trees, which lean on draft quality far harder than chains do -- when the target
++    changed under them the chains moved 0.04-0.10 in acceptance and the trees moved 0.78-0.97.
++    """
++
++    repo_id: str = "deepseek-ai/dspark_qwen3_4b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/4b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftW4A16QuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-4B"
++
++
 +@register_llm_model("qwen3-8b-dflash")
 +@dataclass(init=False, frozen=True)
 +class Qwen3_8B_DFlash(LLMModelConfig):
@@ -648,6 +682,68 @@ index 4e2b051..8b0759c 100644
 +    n_target_layers = 5
 +    mask_token_id = 151669
 +    quant_recipe = Qwen3_DFlashDraftQuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-8B"
++
++
++@register_llm_model("qwen3-8b-dflash-w4")
++@dataclass(init=False, frozen=True)
++class Qwen3_8B_DFlash_W4(LLMModelConfig):
++    """Qwen3_8B_DFlash with 4-bit weights.
++
++    On the 4B target this trade was clearly positive -- 1.4-2.8% acceptance for a 20-24% cheaper
++    draft call, netting +2.0 to +3.6% throughput. The 8B target is the harder case: its verify is
++    96-100 ms against the 4B's 55-63, so the same absolute saving in the draft call is a smaller
++    share of the step and the net gain should shrink. Whether it shrinks to nothing is the question.
++    """
++
++    repo_id: str = "deepseek-ai/dflash_qwen3_8b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/8b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftW4A16QuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-8B"
++
++
++@register_llm_model("qwen3-8b-dspark-w4")
++@dataclass(init=False, frozen=True)
++class Qwen3_8B_DSpark_W4(LLMModelConfig):
++    """DSpark draft head for Qwen3-8B at 4-bit weights.
++
++    The 8B pair only fits at 4 bits -- the 8-bit draft does not load beside a 5.5 GB target and
++    takes the device down trying -- so this is the only way to run PCTree or DARTree against an
++    8B target with the draft on the NPU. Body-identical to the DFlash draft; what makes it DSpark
++    are the Markov and confidence heads, which live on the host and never enter the graph.
++    """
++
++    repo_id: str = "deepseek-ai/dspark_qwen3_8b_block7"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_dflash/config/8b_dflash_config.json"
++    )
++    convert_weights = convert_dflash_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_inject = 16
++    n_target_layers = 5
++    mask_token_id = 151669
++    quant_recipe = Qwen3_DFlashDraftW4A16QuantRecipe
 +    tokenizer_repo_id = "Qwen/Qwen3-8B"
 +
 +
@@ -729,10 +825,10 @@ index 319ea6e..eb0718c 100644
              "attention_mask": attention_mask,
              "labels": None,
 diff --git a/examples/qualcomm/oss_scripts/llama/decoder_constants.py b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
-index 26e5aee..e12d6d3 100644
+index 26e5aee..e6575ae 100644
 --- a/examples/qualcomm/oss_scripts/llama/decoder_constants.py
 +++ b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
-@@ -58,6 +58,20 @@ DECODER_MODEL_VERSION = {
+@@ -58,6 +58,23 @@ DECODER_MODEL_VERSION = {
      "qwen2_5-1_5b": "qwen2_5",
      "qwen3-0_6b": "qwen3",
      "qwen3-1_7b": "qwen3",
@@ -749,11 +845,14 @@ index 26e5aee..e12d6d3 100644
 +    "qwen3-4b-dflash-w4": "qwen3",
 +    "qwen3-4b-dflash-w4a8": "qwen3",
 +    "qwen3-4b-dspark": "qwen3",
++    "qwen3-4b-dspark-w4": "qwen3",
 +    "qwen3-8b-dflash": "qwen3",
++    "qwen3-8b-dflash-w4": "qwen3",
++    "qwen3-8b-dspark-w4": "qwen3",
      "smollm2_135m": "smollm2_135m",
      "smollm3-3b": "smollm3",
      "glm-1_5b": "glm",
-@@ -65,3 +79,18 @@ DECODER_MODEL_VERSION = {
+@@ -65,3 +82,18 @@ DECODER_MODEL_VERSION = {
      "internvl3_1b": "internvl3",
      "gemma4-e2b": "gemma4",
  }

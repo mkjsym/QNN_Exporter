@@ -17,7 +17,10 @@ REVERSE=""
 if [ "${1:-}" = "-R" ] || [ "${1:-}" = "--reverse" ]; then REVERSE="-R"; shift; fi
 ET=${1:-${EXECUTORCH_ROOT:-$HERE/../../executorch}}
 
-[ -d "$ET/.git" ] || { echo "not an ExecuTorch git checkout: $ET" >&2; exit 1; }
+# .git is a directory in a normal clone and a FILE in a linked worktree; accept both, and
+# let git itself be the judge rather than guessing from the filesystem.
+git -C "$ET" rev-parse --git-dir >/dev/null 2>&1 || \
+  { echo "not a git checkout: $ET" >&2; exit 1; }
 ET=$(cd "$ET" && pwd)
 
 head=$(git -C "$ET" rev-parse HEAD)

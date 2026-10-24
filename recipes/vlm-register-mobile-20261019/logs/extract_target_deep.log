@@ -1,0 +1,7 @@
+16:44 START extract deep (params shard_layers corrected)
+[QNN] Using QNN SDK at /home/youngmin/qairt/2.37.1-v81 (from QNN_SDK_ROOT)
+W1019 16:44:13.328000 2797861 site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+Extracted 6 target shards to /data/youngmin/qnn-artifacts/vlm-register-mobile-20261019/ctx_vlm_deep_a32_c4096
+16:44 EXTRACT_EXIT deep 0
+DEEP_TARGET_DONE
+DEEP_CHAIN_EXIT 0

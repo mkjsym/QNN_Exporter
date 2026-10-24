@@ -1,0 +1,44 @@
+18:04 START deep v2 ar=32 (calibrated prompt slots)
+W1019 18:04:51.163000 3080006 site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+/home/youngmin/anaconda3/envs/etqnn/lib/python3.11/copyreg.py:105: FutureWarning: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+  return cls.__new__(cls, *args)
+PTE serialization preflight passed
+W1019 18:04:55.017000 3080103 site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1019 18:04:55.058000 3080103 site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+/home/youngmin/anaconda3/envs/etqnn/lib/python3.11/site-packages/torchtune/__init__.py:18: UserWarning: The 'torch' module has already been imported. Setting PYTORCH_CUDA_ALLOC_CONF may not have an effect.For best results, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing 'torch'.
+  warnings.warn(
+[QNN] Using QNN SDK at /home/youngmin/qairt/2.37.1-v81 (from QNN_SDK_ROOT)
+[WARNING 2026-10-19 18:04:59,324 backend_opinfo_adapter.py:67] The backend_opinfo module couldn't be imported, so the abstract implementation will be used instead. This might be because $QNN_SDK_ROOT/lib/python isn't included in your PYTHONPATH, or the `BackendOpInfo` API isn't available in your QNN SDK version. Note that the `BackendOpInfo` API is supported starting from QNN SDK 2.41 and above.
+I tokenizers:regex.cpp:27] Registering override fallback regex
+[INFO 2026-10-19 18:05:01,480 llama.py:787] *** qwen3-vl-4b-dflash-deep ***
++-----------------------+---------------------------+
+| Config                | Value                     |
++=======================+===========================+
+| decoder_model_version | qwen3                     |
++-----------------------+---------------------------+
+| instruct_model        | True                      |
++-----------------------+---------------------------+
+| masked_softmax        | True                      |
++-----------------------+---------------------------+
+| num_sharding          | 6                         |
++-----------------------+---------------------------+
+| quant_recipe          | Qwen3_4B_SqnrQuantRecipe  |
++-----------------------+---------------------------+
+| r1                    | False                     |
++-----------------------+---------------------------+
+| r2                    | False                     |
++-----------------------+---------------------------+
+| r3                    | True                      |
++-----------------------+---------------------------+
+| repo_id               | Qwen/Qwen3-VL-4B-Instruct |
++-----------------------+---------------------------+
+| seq_mse_candidates    | 0                         |
++-----------------------+---------------------------+
+| shard_layers          | (2, 10, 18, 26, 34)       |
++-----------------------+---------------------------+
+| transform_weight      | False                     |
++-----------------------+---------------------------+
+| vlm_input             | True                      |
++-----------------------+---------------------------+
+[INFO 2026-10-19 18:05:02,515 base_component.py:67] calling HybridTextDecoder::__init__
+[INFO 2026-10-19 21:45:35,967 llm_wrappers.py:511] [Mode.DECODE] cached fp32 weights for later instances

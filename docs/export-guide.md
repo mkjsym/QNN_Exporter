@@ -243,6 +243,86 @@ python examples/qualcomm/oss_scripts/llama/llama.py \
 
 ---
 
+## 4-b. 투기 디코딩 드래프트 export
+
+드래프트는 타깃과 절차가 하나 다르다. **토큰 프롬프트로 캘리브레이션할 수 없다** — 활성값이
+토큰 임베딩이 아니라 타깃의 hidden state다. 그래서 오프라인으로 bf16 타깃을 돌려 덤프해 두고
+재생한다. 이걸 빼먹으면 `fc` 관찰자가 실제로 볼 일 없는 분포를 학습한다(Qwen3-4B의 층 33
+hidden은 16384까지 가는데 mean |x|는 4.5다).
+
+두 계열의 차이는 **읽는 층과 그래프 폭** 둘뿐이다.
+
+| | DFlash 계열 | EAGLE-3 |
+|---|---|---|
+| 등록 이름 | `qwen3-4b-dflash-w4`, `-dspark-w4`, `qwen3-8b-*` | `qwen3-4b-eagle3-w4`, `qwen3-8b-eagle3-w4` |
+| 읽는 타깃 층 | 5개 — `--layer-ids 1,9,17,25,33` | 3개 — `--layer-ids 1,17,32` |
+| 필요한 타깃 빌드 | `qwen3-4b`(6샤드 `[2,10,18,26,34]`) | `qwen3-4b-sqnr-e3`(4샤드 `[2,18,33]`) |
+| `BLOCK` | 8 (제안 블록) | 32 (가장 넓은 호출) |
+| `CKPT` | 불필요 | **필수** |
+
+`--layer-ids`는 한 칸 밀려 있다: 스크립트가 `hidden_states[id + 1]`을 읽고, HF가 인덱스 0에
+임베딩 출력을 놓기 때문이다. EAGLE-3 헤드가 선언한 `target_layers = [2, 18, 33]`을 얻으려면
+`1,17,32`를 준다.
+
+**타깃 빌드가 다른 이유**: 샤딩된 QNN 타깃은 샤드가 넘어가는 자리에서만 잔차를 노출한다.
+드래프트가 읽는 층이 경계여야 하고, **다른 곳은 경계면 안 된다** — 경계 하나가 그래프 호출이자
+`UFIXED_16` 양자화 지점이라, 안 읽는 경계는 비용만 쓴다.
+
+```bash
+# ── 0) EAGLE-3만: 타깃 임베딩을 동봉해 체크포인트 변환 (드래프트는 자체 테이블이 없다)
+python $EXECUTORCH_ROOT/examples/models/qwen3_eagle3/convert_weights.py \
+    <Qwen3-4B-EAGLE3> $WORK/eagle3_4b.pth --target-dir <Qwen3-4B>
+
+# ── 1) 캘리브레이션용 타깃 hidden 덤프 (bf16 타깃, ~10분)
+python $EXECUTORCH_ROOT/examples/qualcomm/oss_scripts/llama/dump_target_hidden.py \
+    --target <Qwen3-4B> --calib ./data/calib_specbench.json \
+    --layer-ids 1,17,32 --out $WORK/hidden_4b_e3.pt
+
+# ── 2) export
+BLOCK=32 CKPT=$WORK/eagle3_4b.pth \
+  ./scripts/export_draft.sh qwen3-4b-eagle3-w4 $WORK/art_e3draft $WORK/hidden_4b_e3.pt
+
+# ── 3) 컨텍스트 추출 (드래프트는 1샤드) + params.json 수작업
+./scripts/extract_context.sh $WORK/art_e3draft $WORK/ctx_e3draft 1
+```
+
+덤프가 끝나면 찍히는 range를 보라. EAGLE-3 4B는 `[-4608, 16384]`에 mean |x| 1.67, p99.9가
+26.4다 — **최댓값이 p99.9보다 620배 위**다. min/max 관찰자가 범위 대부분을 이상치에 쓴다는
+뜻이고, 그래서 드래프트 레시피가 `MarginMinMaxObserver`를 쓴다. 드래프트가 망가지는 방식은
+반올림이 아니라 **클리핑**이다.
+
+### 드래프트 `params.json`
+
+타깃과 필드가 다르다. EAGLE-3 4B:
+
+```json
+{ "dim": 2560, "n_layers": 1, "n_heads": 32, "n_kv_heads": 8, "head_dim": 128,
+  "vocab_size": 32000, "ffn_dim_multiplier": 1, "multiple_of": 256,
+  "norm_eps": 1e-06, "rope_theta": 1000000.0, "use_scaled_rope": false, "n_e3_layers": 3 }
+```
+
+`vocab_size`는 **축소 vocab 32000**이다(타깃의 151936이 아니다). `d2t` 역매핑은 그래프 밖,
+호스트가 top-k 뒤에 몇 개 id에만 적용한다 — 그래프에 넣으면 출력 투영과 호스트의 vocab 스캔이
+둘 다 4.7배가 된다.
+
+### 구운 그래프가 맞는지 보는 법
+
+```
+prefill_forward (ar_len 32)
+  in  h_0 / g_direct / h_1 / h_2 / tok_embd   [1,32,2560] FLOAT_32
+      args_0 [1,8,128,992] / args_1 [1,8,992,128]  UFIXED_8   (KV)
+      input_pos [1,32] INT_32 · atten_mask [1,1,32,1024] UFIXED_16
+  out K [1,8,128,32] / V [1,8,32,128] UFIXED_8
+      prenorm hidden [1,32,2560] FLOAT_32
+      logits [1,32,32000] UFIXED_16
+```
+
+⚠️ **입력 순서가 `h_0, g_direct, h_1, h_2`다** — `forward()` 선언 순서가 아니라 placeholder
+이름 순서다. 러너가 위치로 바인딩하면 가운데 타깃 층 자리에 재귀 상태가 들어가고, 아무것도
+실패하지 않은 채 acceptance만 떨어진다. **이름으로 바인딩할 것.**
+
+---
+
 ## 5. Export가 실제로 하는 일 (②~⑧)
 
 `llama.py:190` `multi_modal_mgr.quantize(...)` → `llama.py:198` `.compile(...)` 두 줄이 전부지만

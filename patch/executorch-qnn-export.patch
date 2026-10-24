@@ -183,24 +183,190 @@ index 0000000..c4be875
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/examples/models/qwen3_eagle3/__init__.py b/examples/models/qwen3_eagle3/__init__.py
+new file mode 100644
+index 0000000..acaf67d
+--- /dev/null
++++ b/examples/models/qwen3_eagle3/__init__.py
+@@ -0,0 +1,3 @@
++from .convert_weights import convert_weights
++
++__all__ = ["convert_weights"]
+diff --git a/examples/models/qwen3_eagle3/config/4b_eagle3_config.json b/examples/models/qwen3_eagle3/config/4b_eagle3_config.json
+new file mode 100644
+index 0000000..32892d0
+--- /dev/null
++++ b/examples/models/qwen3_eagle3/config/4b_eagle3_config.json
+@@ -0,0 +1,17 @@
++{
++  "dim": 2560,
++  "ffn_dim_multiplier": 1,
++  "hidden_dim": 9728,
++  "n_heads": 32,
++  "head_dim": 128,
++  "n_kv_heads": 8,
++  "n_layers": 1,
++  "norm_eps": 1e-06,
++  "rope_theta": 1000000,
++  "use_scaled_rope": false,
++  "vocab_size": 32000,
++  "use_hf_rope": true,
++  "attention_qkv_bias": false,
++  "use_qk_norm": false,
++  "qk_norm_before_rope": false
++}
+diff --git a/examples/models/qwen3_eagle3/config/8b_eagle3_config.json b/examples/models/qwen3_eagle3/config/8b_eagle3_config.json
+new file mode 100644
+index 0000000..45295e9
+--- /dev/null
++++ b/examples/models/qwen3_eagle3/config/8b_eagle3_config.json
+@@ -0,0 +1,17 @@
++{
++  "dim": 4096,
++  "ffn_dim_multiplier": 1,
++  "hidden_dim": 12288,
++  "n_heads": 32,
++  "head_dim": 128,
++  "n_kv_heads": 8,
++  "n_layers": 1,
++  "norm_eps": 1e-06,
++  "rope_theta": 1000000,
++  "use_scaled_rope": false,
++  "vocab_size": 32000,
++  "use_hf_rope": true,
++  "attention_qkv_bias": false,
++  "use_qk_norm": false,
++  "qk_norm_before_rope": false
++}
+diff --git a/examples/models/qwen3_eagle3/convert_weights.py b/examples/models/qwen3_eagle3/convert_weights.py
+new file mode 100644
+index 0000000..4f11c90
+--- /dev/null
++++ b/examples/models/qwen3_eagle3/convert_weights.py
+@@ -0,0 +1,102 @@
++"""Convert an EAGLE-3 draft checkpoint to the static-decoder parameter naming.
++
++An EAGLE-3 draft is one decoder layer under the name `midlayer`, plus three tensors an ordinary
++decoder does not have: `fc`, which projects three concatenated target hidden states down to one
++hidden width; `midlayer.hidden_norm`, which normalizes that projection; and `d2t`, which maps the
++reduced draft vocabulary back onto the target's.
++
++`d2t` and its inverse `t2d` are dropped here on purpose. They are a host-side lookup -- the driver
++already reads them from the draft GGUF and applies them to the handful of ids that survive top-k --
++and putting them in the graph would widen the output projection from 32000 to 151936 for no gain.
++
++The checkpoint has no `embed_tokens`: an EAGLE-3 draft borrows the target's table. The exported
++graph takes ready embeddings for the same reason the DFlash one does, so nothing has to be
++synthesized here.
++"""
++
++import argparse
++from typing import Dict
++
++import torch
++
++from executorch.examples.models.qwen3.convert_weights import load_checkpoint
++
++_EAGLE3_FROM_HF = {
++    "lm_head.weight": "output.weight",
++    "norm.weight": "norm.weight",
++    "midlayer.hidden_norm.weight": "layers.0.hidden_norm.weight",
++    "midlayer.input_layernorm.weight": "layers.0.attention_norm.weight",
++    "midlayer.post_attention_layernorm.weight": "layers.0.ffn_norm.weight",
++    "midlayer.self_attn.q_proj.weight": "layers.0.attention.wq.weight",
++    "midlayer.self_attn.k_proj.weight": "layers.0.attention.wk.weight",
++    "midlayer.self_attn.v_proj.weight": "layers.0.attention.wv.weight",
++    "midlayer.self_attn.o_proj.weight": "layers.0.attention.wo.weight",
++    # Qwen3 applies the activation on gate_proj, so the static decoder's w1/w3 are swapped
++    # relative to the usual w1=up convention -- same swap the Qwen3 converter documents.
++    "midlayer.mlp.gate_proj.weight": "layers.0.feed_forward.w1.weight",
++    "midlayer.mlp.down_proj.weight": "layers.0.feed_forward.w2.weight",
++    "midlayer.mlp.up_proj.weight": "layers.0.feed_forward.w3.weight",
++}
++
++# vocabulary maps the host applies after top-k; see the module docstring
++_HOST_SIDE = ("d2t", "t2d")
++
++
++def eagle3_hf_to_meta(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
++    out = {}
++    for key, value in state_dict.items():
++        if key in _HOST_SIDE:
++            continue
++        if key == "fc.weight":
++            # Split the projection into one block per target layer. The model sums the blocks
++            # instead of projecting a concatenation, so each target layer keeps its own activation
++            # scale -- see eagle3_draft.py for why that matters.
++            dim = value.shape[0]
++            n = value.shape[1] // dim
++            assert value.shape[1] == dim * n, f"fc is not a whole number of blocks: {value.shape}"
++            for i in range(n):
++                out[f"fc.{i}.weight"] = value[:, i * dim:(i + 1) * dim].contiguous()
++            continue
++        if key in _EAGLE3_FROM_HF:
++            out[_EAGLE3_FROM_HF[key]] = value
++            continue
++        raise KeyError(f"unmapped EAGLE-3 tensor: {key}")
++    return out
++
++
++def convert_weights(input_dir: str, output_file: str, target_dir: str = None) -> None:
++    print("Loading checkpoint...")
++    sd = load_checkpoint(input_dir)
++    print("Converting checkpoint...")
++    sd = eagle3_hf_to_meta(sd)
++    if target_dir:
++        # The draft borrows the target's embedding table. It is not a graph input -- forward never
++        # touches it, so it is stripped at to_edge -- but calibration has to do the lookup the
++        # runtime does on the host, and dump_draft_embd.py reads it from here to write the fp16
++        # file the device mmaps. Carrying it in this checkpoint keeps both from needing a second
++        # path to the target.
++        tgt = load_checkpoint(target_dir)
++        for key in ("model.embed_tokens.weight", "embed_tokens.weight", "tok_embeddings.weight"):
++            if key in tgt:
++                sd["tok_embeddings.weight"] = tgt[key]
++                print(f"  + tok_embeddings.weight from target ({tuple(tgt[key].shape)})")
++                break
++        else:
++            raise KeyError(f"no embedding table in {target_dir}; have {sorted(tgt)[:6]}...")
++    print(f"Saving checkpoint to {output_file}...")
++    torch.save(sd, output_file)
++    print("Done.")
++
++
++def main():
++    parser = argparse.ArgumentParser(description="Convert an EAGLE-3 draft checkpoint.")
++    parser.add_argument("input_dir", type=str, help="Directory holding the EAGLE-3 checkpoint.")
++    parser.add_argument("output", type=str, help="Path to the output checkpoint.")
++    parser.add_argument("--target-dir", type=str, default=None,
++                        help="Target model directory, to copy its embedding table in.")
++    args = parser.parse_args()
++    convert_weights(args.input_dir, args.output, args.target_dir)
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/examples/qualcomm/oss_scripts/llama/__init__.py b/examples/qualcomm/oss_scripts/llama/__init__.py
-index 4e2b051..599d604 100644
+index 4e2b051..6fea173 100644
 --- a/examples/qualcomm/oss_scripts/llama/__init__.py
 +++ b/examples/qualcomm/oss_scripts/llama/__init__.py
-@@ -9,7 +9,11 @@ from abc import ABC
+@@ -9,7 +9,14 @@ from abc import ABC
  from dataclasses import dataclass
  from enum import Enum
  from functools import partial
 -from typing import Callable, Dict, Optional, Sequence, Type, Union
 +from typing import Callable, Dict, List, Optional, Sequence, Type, Union
 +
++from executorch.examples.models.qwen3_eagle3 import (
++    convert_weights as convert_eagle3_weights,
++)
 +from executorch.examples.models.qwen3_dflash import (
 +    convert_weights as convert_dflash_weights,
 +)
  
  from executorch.examples.models.codegen import (
      convert_weights as convert_codegen_weights,
-@@ -87,6 +91,15 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
+@@ -87,6 +94,15 @@ from executorch.examples.qualcomm.oss_scripts.llama.static_llm_quant_recipe impo
      Qwen2_5_1_5BQuantRecipe,
      Qwen3_0_6BQuantRecipe,
      Qwen3_1_7BQuantRecipe,
@@ -216,12 +382,15 @@ index 4e2b051..599d604 100644
      Smollm2QATQuantRecipe,
      Smollm2QuantRecipe,
      Smollm3QuantRecipe,
-@@ -99,7 +112,19 @@ from tabulate import tabulate
+@@ -99,7 +115,24 @@ from tabulate import tabulate
  BASE_DIR = os.path.dirname(__file__)
  
  
 +from executorch.examples.qualcomm.oss_scripts.llama.model.dflash_draft import (  # noqa: E402
 +    DFlashDraftModel,
++)
++from executorch.examples.qualcomm.oss_scripts.llama.model.eagle3_draft import (  # noqa: E402
++    Eagle3DraftModel,
 +)
 +
  LLM_VARIANT_ARCHS: Dict[str, LlamaModel] = {
@@ -233,10 +402,12 @@ index 4e2b051..599d604 100644
 +    "qwen3-8b-dflash": DFlashDraftModel,
 +    "qwen3-8b-dflash-w4": DFlashDraftModel,
 +    "qwen3-8b-dspark-w4": DFlashDraftModel,
++    "qwen3-4b-eagle3-w4": Eagle3DraftModel,
++    "qwen3-8b-eagle3-w4": Eagle3DraftModel,
      "gemma3-1b": MultiScopeAwareLlamaModel,
      "granite_speech_3_3-2b": LlamaModelWithoutEmbedding,
      "smolvlm_500m_instruct": LlamaModelWithoutEmbedding,
-@@ -121,6 +146,10 @@ class LLMModelConfig(ABC):
+@@ -121,6 +154,10 @@ class LLMModelConfig(ABC):
      transform_weight: Set to true to change Hugging Face weight to improve the performance of RoPE in HTP backend.
      instruct_model: True if the model uses chat templates. Check Hugging Face model card to ensure the model uses chat templates.
      num_sharding: Specify the number of splits by inserting the fallback custom op. The graph will be split evenly by layers.
@@ -247,7 +418,7 @@ index 4e2b051..599d604 100644
      masked_softmax: The MaskedSoftmax feature is designed to optimize the LLMs accuracy and performance executed on HTP backend.
                      MaskedSoftmax is used to replace the Softmax(Add(In, Mask)) structure in attention block in LLMs during backend optimization.
                      For more details, please refer to QNN documents. Note that it is only supported starting from QNN 2.35.
-@@ -149,6 +178,12 @@ class LLMModelConfig(ABC):
+@@ -149,6 +186,12 @@ class LLMModelConfig(ABC):
      r3: bool
      quant_recipe: StaticLLMQuantRecipe
      qat_recipe: Optional[Type[StaticLLMQuantRecipe]] = None
@@ -260,7 +431,7 @@ index 4e2b051..599d604 100644
  
      def __str__(self):  # noqa: C901
          """
-@@ -173,7 +208,9 @@ class LLMModelConfig(ABC):
+@@ -173,7 +216,9 @@ class LLMModelConfig(ABC):
              elif isinstance(v, Enum):
                  return f"{v.__class__.__name__}.{v.name}"
              elif isinstance(v, (tuple, list)):
@@ -271,7 +442,7 @@ index 4e2b051..599d604 100644
              elif isinstance(v, (str, int, float, bool)):
                  return v
              else:
-@@ -532,6 +569,478 @@ class Qwen3_1_7B(LLMModelConfig):
+@@ -532,6 +577,586 @@ class Qwen3_1_7B(LLMModelConfig):
      quant_recipe = Qwen3_1_7BQuantRecipe
  
  
@@ -414,6 +585,41 @@ index 4e2b051..599d604 100644
 +    instruct_model = True
 +    num_sharding = 6
 +    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_4B_SqnrQuantRecipe
++
++
++@register_llm_model("qwen3-4b-sqnr-e3")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_Sqnr_E3(LLMModelConfig):
++    """Qwen3_4B_Sqnr sharded for EAGLE-3: boundaries exactly on its target_layers, and nowhere else.
++
++    The released Qwen3-4B EAGLE-3 head declares eagle3.target_layers = [2, 18, 33] and consumes the
++    INPUT residual of each. A sharded QNN target exposes a residual only where one shard hands over
++    to the next, so those three layers have to be boundaries -- and no others should be, because a
++    boundary is not free. Each one is a graph invocation and a UFIXED_16 quantization point, so a
++    boundary the draft never reads costs dispatch and accuracy and returns nothing.
++
++    Hence 4 shards at [2, 18, 33] -- 2/16/15/3 layers -- rather than the deployed 6 at
++    [2, 10, 18, 26, 34], whose five boundaries exist because the DFlash draft reads all five.
++
++    The 16-layer shard is well past anything exported so far (the deployed maximum is 8), so graph
++    size and peak export memory are the risks to watch.
++    """
++
++    repo_id: str = "Qwen/Qwen3-4B"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3/config/4b_config.json"
++    )
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 4
++    shard_layers = [2, 18, 33]
 +    masked_softmax = True
 +    seq_mse_candidates = 0
 +    r1 = False
@@ -716,6 +922,79 @@ index 4e2b051..599d604 100644
 +    tokenizer_repo_id = "Qwen/Qwen3-8B"
 +
 +
++@register_llm_model("qwen3-4b-eagle3-w4")
++@dataclass(init=False, frozen=True)
++class Qwen3_4B_Eagle3_W4(LLMModelConfig):
++    """Qwen3-4B EAGLE-3 draft head, 4-bit weights and 16-bit activations.
++
++    `n_e3_layers = 3` is what marks this an EAGLE-3 draft rather than a DFlash one: the graph takes
++    three target hidden states plus a `g_direct` slot for the recurrent depths, where a DFlash draft
++    takes five hidden states and a block of masked positions. The two never share a code path
++    downstream of that count.
++
++    The three layers are the shard boundaries the target exposes, and the TARGET has to be baked to
++    put them there -- see qwen3-4b-sqnr-e3, whose shards split at [2, 18, 33]. A target sharded
++    anywhere else hands this draft hidden states from the wrong depths, which costs acceptance
++    without failing anything visibly.
++
++    The quantization recipe is the DFlash draft's, unchanged: 4-bit per-block linears, an 8-bit
++    per-channel head, and MarginMinMaxObserver on the activations. That observer is the part that
++    decided the DFlash draft's accuracy -- its failure mode was clipping, not rounding -- and this
++    draft reads the same target hidden states, whose few always-large channels are what the margin
++    exists for.
++
++    Weights are 4-bit for the reason they are on the DFlash draft: a call on this NPU costs what its
++    weights cost to stream, at ~18 ms/GB, so halving them halves the call.
++    """
++
++    repo_id: str = "AngelSlim/Qwen3-4B_eagle3"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_eagle3/config/4b_eagle3_config.json"
++    )
++    convert_weights = convert_eagle3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_e3_layers = 3
++    target_vocab_size = 151936
++    quant_recipe = Qwen3_DFlashDraftW4A16QuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-4B"
++
++
++@register_llm_model("qwen3-8b-eagle3-w4")
++@dataclass(init=False, frozen=True)
++class Qwen3_8B_Eagle3_W4(LLMModelConfig):
++    """Qwen3-8B EAGLE-3 draft head, 4-bit weights and 16-bit activations.
++
++    Same graph as the 4B entry at the 8B target's width. On the DFlash side 4-bit was the only
++    weight width that would load at all on 8B -- 8-bit rebooted the phone -- so this one does not
++    get a w8 sibling to compare against.
++    """
++
++    repo_id: str = "AngelSlim/Qwen3-8B_eagle3"
++    params_path: str = os.path.join(
++        BASE_DIR, "../../../models/qwen3_eagle3/config/8b_eagle3_config.json"
++    )
++    convert_weights = convert_eagle3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 1
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    n_e3_layers = 3
++    target_vocab_size = 151936
++    quant_recipe = Qwen3_DFlashDraftW4A16QuantRecipe
++    tokenizer_repo_id = "Qwen/Qwen3-8B"
++
++
 +@register_llm_model("qwen3-8b-dspark-w4")
 +@dataclass(init=False, frozen=True)
 +class Qwen3_8B_DSpark_W4(LLMModelConfig):
@@ -825,10 +1104,10 @@ index 319ea6e..eb0718c 100644
              "attention_mask": attention_mask,
              "labels": None,
 diff --git a/examples/qualcomm/oss_scripts/llama/decoder_constants.py b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
-index 26e5aee..e6575ae 100644
+index 26e5aee..ab42409 100644
 --- a/examples/qualcomm/oss_scripts/llama/decoder_constants.py
 +++ b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
-@@ -58,6 +58,23 @@ DECODER_MODEL_VERSION = {
+@@ -58,6 +58,26 @@ DECODER_MODEL_VERSION = {
      "qwen2_5-1_5b": "qwen2_5",
      "qwen3-0_6b": "qwen3",
      "qwen3-1_7b": "qwen3",
@@ -838,6 +1117,7 @@ index 26e5aee..e6575ae 100644
 +    "qwen3-4b-kv16-mse": "qwen3",
 +    "qwen3-4b-kv16-hist": "qwen3",
 +    "qwen3-4b-sqnr": "qwen3",
++    "qwen3-4b-sqnr-e3": "qwen3",
 +    "qwen3-4b-r2": "qwen3",
 +    "qwen3-4b-lc": "qwen3",
 +    "qwen3-8b": "qwen3",
@@ -848,11 +1128,13 @@ index 26e5aee..e6575ae 100644
 +    "qwen3-4b-dspark-w4": "qwen3",
 +    "qwen3-8b-dflash": "qwen3",
 +    "qwen3-8b-dflash-w4": "qwen3",
++    "qwen3-4b-eagle3-w4": "qwen3",
++    "qwen3-8b-eagle3-w4": "qwen3",
 +    "qwen3-8b-dspark-w4": "qwen3",
      "smollm2_135m": "smollm2_135m",
      "smollm3-3b": "smollm3",
      "glm-1_5b": "glm",
-@@ -65,3 +82,18 @@ DECODER_MODEL_VERSION = {
+@@ -65,3 +85,18 @@ DECODER_MODEL_VERSION = {
      "internvl3_1b": "internvl3",
      "gemma4-e2b": "gemma4",
  }
@@ -963,28 +1245,29 @@ index 0000000..ee03c0c
 +if __name__ == "__main__":
 +    main()
 diff --git a/examples/qualcomm/oss_scripts/llama/inference/__init__.py b/examples/qualcomm/oss_scripts/llama/inference/__init__.py
-index 9f50005..8fb5cc1 100644
+index 9f50005..44b867a 100644
 --- a/examples/qualcomm/oss_scripts/llama/inference/__init__.py
 +++ b/examples/qualcomm/oss_scripts/llama/inference/__init__.py
-@@ -7,6 +7,7 @@
+@@ -7,6 +7,8 @@
  from executorch.examples.qualcomm.oss_scripts.llama.inference.decoder import (
      DecoderInference,
      DecoderInputs,
 +    DFlashDecoderInference,
++    Eagle3DecoderInference,
      merge_modality_embeddings,
  )
  from executorch.examples.qualcomm.oss_scripts.llama.inference.encoder import (
-@@ -19,6 +20,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.inference.model import (
+@@ -19,6 +21,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.inference.model import (
  __all__ = [
      "DecoderInputs",
      "DecoderInference",
 +    "DFlashDecoderInference",
-+    "DFlashDecoderInference",
++    "Eagle3DecoderInference",
      "EncoderInference",
      "ModelInference",
      "merge_modality_embeddings",
 diff --git a/examples/qualcomm/oss_scripts/llama/inference/decoder.py b/examples/qualcomm/oss_scripts/llama/inference/decoder.py
-index 03b38e9..11e7fb4 100644
+index 03b38e9..c68198d 100644
 --- a/examples/qualcomm/oss_scripts/llama/inference/decoder.py
 +++ b/examples/qualcomm/oss_scripts/llama/inference/decoder.py
 @@ -8,7 +8,10 @@ from dataclasses import dataclass
@@ -999,7 +1282,7 @@ index 03b38e9..11e7fb4 100644
  
  
  def merge_modality_embeddings(
-@@ -162,3 +165,148 @@ class DecoderInference:
+@@ -162,3 +165,298 @@ class DecoderInference:
              return out[0] if isinstance(out, (tuple, list)) else out
  
          return _forward
@@ -1148,6 +1431,156 @@ index 03b38e9..11e7fb4 100644
 +            *self._k_caches, *self._v_caches,
 +        )
 +        return logits
++
++
++class Eagle3DecoderInference(DecoderInference):
++    """Calibration/eval driver for an EAGLE-3 draft head.
++
++    Every row this graph processes is a pair: a token embedding and a hidden state `g`. Which side
++    of the fc supplies `g` depends on depth, and both cases have to be calibrated, because they put
++    different distributions through the same tensors:
++
++        depth 0  -- `g` comes from the target's hidden states at three layer boundaries, projected
++                    by fc. These are replayed from a dump taken offline against the bf16 target,
++                    for the same reason the DFlash driver replays them: feed the observers token
++                    embeddings and fc learns a range that has nothing to do with what it will see.
++        depth >0 -- `g` is the layer's own pre-norm output from the previous call, at dim already.
++                    This is not something a dump can supply, so it is taken from the model's own
++                    second output and fed back -- which is exactly what the runtime does.
++
++    The loop alternates: one boundary step, then `recurrent_depth` steps fed from their own output.
++    Calibrating only the boundary case leaves hidden_norm and the attention projections fitted to
++    fc-shaped activations, and the tree collapses past depth 1 on device.
++    """
++
++    def __init__(self, get_example_inputs: Callable, hidden_dump: str,
++                 n_e3_layers: int = 3, embedding=None, recurrent_depth: int = 5, **kwargs):
++        ex = get_example_inputs()
++        assert len(ex) == 6, (
++            f"Eagle3DecoderInference expects (hidden list + g_direct, tok_embd, atten_mask, pos, "
++            f"k_caches, v_caches); got {len(ex)} elements."
++        )
++        _, _, self._default_attn_mask, _, self._k_caches, self._v_caches = ex
++        self.max_context_len = kwargs.get("max_context_len", 1024)
++        self.max_batch_size = kwargs.get("max_batch_size", 1)
++        self.audio_token_id = None
++        self.image_token_id = None
++        self._dtype = torch.int64 if kwargs.get("use_i64_token", False) else torch.int32
++        self.pos_ids = (
++            torch.arange(self.max_context_len, dtype=torch.int32)
++            .unsqueeze(0).expand(self.max_batch_size, -1).contiguous()
++        )
++        self.n_e3_layers = n_e3_layers
++        self.recurrent_depth = recurrent_depth
++        # The graph takes embeddings, not token ids -- an EAGLE-3 draft owns no table (it borrows
++        # the target's), so calibration does the lookup the runtime does on the host.
++        self._embedding = embedding
++        blob = torch.load(hidden_dump, weights_only=False)
++        self._hidden = blob["hidden"] if isinstance(blob, dict) else blob
++        self._cursor = 0
++        self._cache_pos = 0     # how much of the calibration cache holds real values
++        self._depth = 0         # 0 = boundary step, >0 = recurrent
++        self._last_hidden = None
++
++    def _embed(self, ids: torch.Tensor) -> torch.Tensor:
++        if self._embedding is None:
++            raise RuntimeError(
++                "Eagle3DecoderInference needs the embedding table: the graph takes embeddings, so "
++                "calibration has to look the ids up itself."
++            )
++        return self._embedding(ids).float()
++
++    def _next_hidden(self, n: int) -> List[torch.Tensor]:
++        """Take the next n rows of the dump, split per target layer, wrapping around."""
++        total = self._hidden.shape[0]
++        idx = (torch.arange(n) + self._cursor) % total
++        self._cursor = (self._cursor + n) % total
++        rows = self._hidden[idx].unsqueeze(0)                       # [1, n, dim*n_e3_layers]
++        dim = rows.shape[-1] // self.n_e3_layers
++        return [rows[..., i * dim:(i + 1) * dim].contiguous()
++                for i in range(self.n_e3_layers)]
++
++    def _g_inputs(self, n: int, dim: int):
++        """(target hiddens, g_direct) for this step: exactly one side is non-zero."""
++        zeros = torch.zeros(1, n, dim)
++        if self._depth == 0 or self._last_hidden is None:
++            return self._next_hidden(n), zeros
++        g = self._last_hidden
++        if g.shape[1] != n:                                         # pad or trim to this ar_len
++            g = (g[:, :n] if g.shape[1] > n
++                 else torch.cat([g, zeros[:, g.shape[1]:]], dim=1))
++        return [zeros] * self.n_e3_layers, g
++
++    def _run(self, model, input_ids: torch.Tensor, masks) -> tuple:
++        """One calibration step, exercising whichever source of `g` this step is due.
++
++        Both entry points come through here. That matters more than it looks: PTQ calibrates via
++        predict_step, and an earlier version of this class only advanced the depth counter inside
++        make_forward_fn -- so `g_direct` was fed zeros for the entire calibration, its observer
++        collected a degenerate range, and the exported graph quantized the recurrent input away
++        entirely. On device the draft was then correct at depth 0 and blind at every depth after it:
++        acceptance 1.86 where the same head on Adreno gets 4.16, with nothing failing.
++        """
++        k, v = self._k_caches, self._v_caches
++        pos = self.pos_ids
++        cache_len = k[0].shape[-1] if len(k) else 0
++        cur = self._cache_pos
++
++        ar_len = input_ids.shape[-1]
++        embd = self._embed(input_ids)
++        hs, g_direct = self._g_inputs(ar_len, embd.shape[-1])
++        pos_row = pos[:, cur:cur + ar_len]
++
++        fixed = []
++        for m in masks:
++            m = m.clone()
++            m[..., :cache_len] = PADDING_MASK_VALUE          # close the whole cache, then
++            if cur > 0:
++                m[..., :cur] = 0                             # reopen only what has been written
++            fixed.append(m)
++
++        out = model(*hs, g_direct, embd, *fixed, pos_row, *k, *v)
++
++        # feed this call's pre-norm hidden back as the next step's g, as the runtime does
++        self._last_hidden = out[1].detach() if len(out) > 1 else None
++        self._depth = (self._depth + 1) % (self.recurrent_depth + 1)
++
++        # write the new K/V into the calibration cache, so the cache observers see real values
++        if len(out) > 2 and cache_len:
++            flat = []
++            for x in out[2:]:
++                flat.extend(x) if isinstance(x, (list, tuple)) else flat.append(x)
++            half = len(flat) // 2
++            room = min(ar_len, cache_len - cur)
++            if room > 0:
++                for i in range(half):
++                    k[i][..., cur:cur + room] = flat[i][..., :room].detach()
++                    v[i][:, :, cur:cur + room, :] = flat[half + i][:, :, :room, :].detach()
++            self._cache_pos = (cur + room) % max(1, cache_len - ar_len)
++
++        return out
++
++    def make_forward_fn(self) -> Callable:
++        """Calibrate the way the graph will actually run: a cache that fills up, and both `g`s.
++
++        The base loop hands the model the same zero-filled cache on every call, which is right for a
++        decoder whose CALIBRATE graph swallows the whole context at once. A draft head reads its
++        cache on every step after the first, and the encodings collected here are copied onto the
++        DECODE and PREFILL graphs -- so calibrating against an empty cache sets the quantization
++        parameters for a tensor that was never observed.
++        """
++        self_ref = self
++
++        def _forward(model, model_inputs: dict) -> torch.Tensor:
++            out = self_ref._run(model, model_inputs["input_ids"], model_inputs["attention_mask"])
++            return out[0]
++
++        return _forward
++
++    @torch.no_grad()
++    def predict_step(self, module, input_ids, attn_mask=None, hidden_states=(), tok_embedding=None):
++        masks = attn_mask if attn_mask is not None else self._default_attn_mask
++        return self._run(module, input_ids, masks)[0]
 diff --git a/examples/qualcomm/oss_scripts/llama/llama.py b/examples/qualcomm/oss_scripts/llama/llama.py
 index 0208ebe..d309547 100755
 --- a/examples/qualcomm/oss_scripts/llama/llama.py
@@ -1583,6 +2016,330 @@ index 0000000..dd19862
 +        meta = super().get_metadata()
 +        meta["n_inject"] = self.n_inject
 +        meta["n_target_layers"] = self.n_target_layers
++        return meta
+diff --git a/examples/qualcomm/oss_scripts/llama/model/eagle3_draft.py b/examples/qualcomm/oss_scripts/llama/model/eagle3_draft.py
+new file mode 100644
+index 0000000..015dd45
+--- /dev/null
++++ b/examples/qualcomm/oss_scripts/llama/model/eagle3_draft.py
+@@ -0,0 +1,318 @@
++# Copyright (c) Qualcomm Innovation Center, Inc.
++# All rights reserved
++#
++# This source code is licensed under the BSD-style license found in the
++# LICENSE file in the root directory of this source tree.
++"""EAGLE-3 speculative-decoding draft head.
++
++An EAGLE-3 draft is one decoder layer that predicts what the target will say next. Every row it
++processes carries two things: the embedding of the token at that position, and a hidden state `g`
++describing what the model already knows there. That pairing is the whole architecture, and it is
++what makes this layer unlike an ordinary decoder layer:
++
++    - the two are normed SEPARATELY -- `input_layernorm` on the embedding, `hidden_norm` on `g` --
++      and then CONCATENATED, so Q, K and V are projected from 2*dim rather than dim.
++    - the residual stream is `g`, not the concatenation. The attention output is added to the raw,
++      un-normed `g`; the token embedding contributes only through attention.
++    - there is no q/k norm, unlike the Qwen3 target it drafts for.
++
++`g` has two sources depending on where in a step the row sits, and a static graph has to serve both:
++
++    depth 0 -- the rows the target just committed. `g` is the target's own hidden state, read at
++               three layer boundaries (low/mid/high) and projected down by `fc` (3*dim -> dim).
++    depth d>0 -- the tree frontier. `g` is this layer's own pre-norm output from the parent row, at
++               dim already; `fc` has no part in it.
++
++Rather than branch, the graph computes `g = sum_i fc_i(h_i) + g_direct` and the caller zeroes
++whichever side does not apply. `fc` carries no bias, so `fc(0) = 0` exactly and the sum is the
++identity in both directions -- no selector, no second graph, and the fc pass costs about 10 MB of
++weight streaming (~0.2 ms) on the steps that do not need it.
++
++Splitting `fc` into three per-layer blocks that are summed is the same projection as one 7680-wide
++matmul -- sum_i fc_i(h_i) == fc(cat(h_i)) -- but it gives each target layer its own activation
++scale. That matters here for the same reason it does in the DFlash draft: a Qwen3-4B target's early
++and late hidden states are not on comparable scales, and one 16-bit scale set by the largest would
++round the smallest to zero.
++
++The draft owns no embedding table (the checkpoint has no `embed_tokens`; it borrows the target's),
++so rows arrive as ready embeddings, exactly as they do for DFlash. Its output head is a REDUCED
++vocabulary -- 32000 of the target's 151936 -- with a `d2t` map back. That map is a host-side
++concern: keeping it out of the graph is worth 4.7x on both the output projection and every
++vocabulary scan the host does afterwards.
++"""
++
++from typing import List, Optional, Tuple
++
++import torch
++import torch.nn as nn
++
++from executorch.examples.models.llama.model_args import ModelArgs
++
++from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import (
++    AttentionMask,
++    CausalAttentionMask,
++)
++
++from .static_llama import (
++    LlamaAttention,
++    LlamaDecoderLayer,
++    LlamaModel,
++    NORM_REGISTRY,
++    repeat_kv,
++)
++
++
++class Eagle3Attention(LlamaAttention):
++    """Attention whose Q/K/V read a 2*dim concatenation instead of the hidden state.
++
++    Everything downstream of the projections -- rope, the cache layout, the mask convention -- is
++    the base class's. Only the input width and the absence of q/k norm differ, so this overrides
++    the projection widths in __init__ and reimplements forward without the norm branches.
++    """
++
++    def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
++        super().__init__(layer_idx, config, output_new_cache_only)
++        # the base class sized these for a dim-wide input; EAGLE-3 feeds them [embd_norm | g_norm]
++        self.wq = nn.Linear(2 * self.dim, self.n_heads * self.head_dim, bias=False)
++        self.wk = nn.Linear(2 * self.dim, self.n_kv_heads * self.head_dim, bias=False)
++        self.wv = nn.Linear(2 * self.dim, self.n_kv_heads * self.head_dim, bias=False)
++        assert not self.use_qk_norm, (
++            "the EAGLE-3 draft checkpoints carry no q_norm/k_norm; the config asks for them"
++        )
++
++    def prepare_attention_conv(self):
++        """The base version sizes Q/K/V for a dim-wide input; these read the 2*dim concatenation.
++
++        Everything else is the base class's, including the rebinding of forward and the deletion of
++        the Linear modules once their weights have been copied across.
++        """
++        self.wq_conv = nn.Conv2d(2 * self.dim, self.n_heads * self.head_dim, 1, bias=False)
++        self.wk_conv = nn.Conv2d(2 * self.dim, self.n_kv_heads * self.head_dim, 1, bias=False)
++        self.wv_conv = nn.Conv2d(2 * self.dim, self.n_kv_heads * self.head_dim, 1, bias=False)
++        self.wo_conv = nn.Conv2d(self.n_heads * self.head_dim, self.dim, 1, bias=False)
++
++        self.forward_no_conv = self.forward
++        self.forward = self.forward_attention_conv
++
++        self.wq_conv.weight.data.copy_(self.wq.weight[:, :, None, None])
++        self.wk_conv.weight.data.copy_(self.wk.weight[:, :, None, None])
++        self.wv_conv.weight.data.copy_(self.wv.weight[:, :, None, None])
++        self.wo_conv.weight.data.copy_(self.wo.weight[:, :, None, None])
++
++        del self.wq
++        del self.wk
++        del self.wv
++        del self.wo
++
++    def _forward_impl(
++        self,
++        x: torch.Tensor,                # [b, seq, 2*dim] -- concatenated, already normed
++        freqs_cos: torch.Tensor,
++        freqs_sin: torch.Tensor,
++        atten_mask: torch.Tensor,
++        k_caches: torch.Tensor,
++        v_caches: torch.Tensor,
++        conv: bool,
++    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
++        bsz, seq_len, _ = x.shape
++
++        if conv:
++            h = torch.reshape(x, (bsz, seq_len, 1, 2 * self.dim)).transpose(1, 3)
++            q = self.wq_conv(h).permute(0, 3, 1, 2).squeeze(-1)
++            k = self.wk_conv(h).permute(0, 3, 1, 2).squeeze(-1)
++            v = self.wv_conv(h).permute(0, 3, 1, 2).squeeze(-1)
++        else:
++            q, k, v = self.wq(x), self.wk(x), self.wv(x)
++        q = q.view(bsz, seq_len, self.n_heads,    self.head_dim).transpose(1, 2)
++        k = k.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
++        v = v.view(bsz, seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
++
++        if self.use_rope:
++            q = self.apply_rope_emb(q, freqs_cos, freqs_sin)
++            k = self.apply_rope_emb(k, freqs_cos, freqs_sin)
++        if getattr(self.config, "enable_r3", False):
++            q = torch.matmul(q, self.r3_weight)
++            k = torch.matmul(k, self.r3_weight)
++        k = k.transpose(2, 3)
++
++        kh = repeat_kv(torch.cat([k_caches, k], dim=-1), self.num_key_value_groups)
++        vh = repeat_kv(torch.cat([v_caches, v], dim=2),  self.num_key_value_groups)
++
++        attn = (q @ kh) / self.scale
++        if self.enable_masked_softmax:
++            attn_min = torch.amin(attn, dim=-1, keepdim=True)
++            attn = torch.where(atten_mask == 0, attn, attn_min + (-20))
++        else:
++            attn = attn + atten_mask
++        attn = self.attn_softmax(attn)
++        y = (attn @ vh).transpose(1, 2)
++        if conv:
++            y = y.reshape(bsz, seq_len, 1, -1).transpose(1, 3)
++            y = self.wo_conv(y).transpose(1, 3).reshape(bsz, seq_len, -1)
++        else:
++            y = self.wo(y.reshape(bsz, seq_len, -1))
++
++        return y, [k], [v]
++
++    def forward(self, x, freqs_cos, freqs_sin, atten_mask, k_caches, v_caches):
++        return self._forward_impl(x, freqs_cos, freqs_sin, atten_mask,
++                                  k_caches, v_caches, conv=False)
++
++    def forward_attention_conv(self, x, freqs_cos, freqs_sin, atten_mask, k_caches, v_caches):
++        return self._forward_impl(x, freqs_cos, freqs_sin, atten_mask,
++                                  k_caches, v_caches, conv=True)
++
++
++class Eagle3DecoderLayer(LlamaDecoderLayer):
++    """The single midlayer: two norms in, concatenate, attend, residual on `g`, then the MLP."""
++
++    def __init__(self, layer_idx: int, config: ModelArgs, output_new_cache_only=False):
++        super().__init__(layer_idx, config, output_new_cache_only)
++        self.attention = Eagle3Attention(
++            layer_idx=layer_idx, config=config, output_new_cache_only=output_new_cache_only
++        )
++        # `attention_norm` (== input_layernorm) is inherited and applies to the token embedding;
++        # this second norm applies to g. The reference calls it hidden_norm.
++        self.hidden_norm = NORM_REGISTRY[config.norm_type](config.dim, eps=config.norm_eps)
++
++    def forward(self, embd, g, freqs_cos, freqs_sin, atten_mask, k_caches, v_caches):
++        x = torch.cat([self.attention_norm(embd), self.hidden_norm(g)], dim=-1)
++        h, k_cache, v_cache = self.attention(
++            x=x,
++            freqs_cos=freqs_cos,
++            freqs_sin=freqs_sin,
++            atten_mask=atten_mask,
++            k_caches=k_caches,
++            v_caches=v_caches,
++        )
++        # the residual is the raw g, not the concatenation and not its normed form
++        h = g + h
++        out = self.feed_forward(self.ffn_norm(h))
++        return h + out, k_cache, v_cache
++
++
++class Eagle3DraftModel(LlamaModel):
++    """One graph call per tree depth: take (embedding, g) rows, return logits and the next g.
++
++    `ar_len` is how many rows one call processes. The driver uses it two ways -- the recompute pass
++    over the tokens the target just committed, and each depth's frontier expansion -- so it is sized
++    for the larger of the two and the caller pads. Padding is close to free on this backend: a call
++    costs what its weights cost to stream, and the rows ride along.
++
++    The pre-norm hidden is returned alongside the logits because the next depth needs it as `g`.
++    Keeping it on the device side of the boundary is the point of exporting the draft at all: the
++    host never has to assemble a 7680-wide feature or round-trip a hidden state.
++    """
++
++    def __init__(self, config: ModelArgs, ar_len=1, output_new_cache_only=True,
++                 output_cache=True, use_i64_token=False, n_e3_layers=3,
++                 target_vocab_size=151936, **kwargs):
++        super().__init__(
++            config=config, ar_len=ar_len, output_new_cache_only=output_new_cache_only,
++            output_cache=output_cache, use_i64_token=use_i64_token, **kwargs
++        )
++        self.n_e3_layers = n_e3_layers
++        # config.vocab_size is the DRAFT vocabulary (32000), which is what the logits tensor is and
++        # therefore what the wrapper matches against to find the output. The embedding table is the
++        # TARGET's, at its own width -- the draft owns no table and borrows the target's. It never
++        # appears in forward, so it is stripped at to_edge; it is here only so calibration can do
++        # the lookup the runtime does on the host.
++        self.target_vocab_size = target_vocab_size
++        self.tok_embeddings = nn.Embedding(target_vocab_size, config.dim)
++        self.layers = nn.ModuleList(
++            [Eagle3DecoderLayer(i, config, output_new_cache_only) for i in range(config.n_layers)]
++        )
++        assert config.n_layers == 1, (
++            f"an EAGLE-3 draft is a single midlayer; config says {config.n_layers}"
++        )
++        # one block per target layer, summed in forward: sum_i fc_i(h_i) == fc(cat(h_i))
++        self.fc = nn.ModuleList(
++            [nn.Linear(config.dim, config.dim, bias=False) for _ in range(n_e3_layers)]
++        )
++        # reduced-vocabulary head; d2t stays on the host
++
++    def forward(
++        self,
++        h_0: torch.Tensor,
++        h_1: torch.Tensor,
++        h_2: torch.Tensor,
++        g_direct: torch.Tensor,
++        tok_embd: torch.Tensor,
++        atten_mask: torch.Tensor,
++        input_pos: torch.Tensor,
++        *args,
++    ) -> Tuple[torch.Tensor, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
++        """Three target hiddens named rather than packed.
++
++        The export pipeline identifies KV cache inputs by placeholder name -- it looks for `args_<i>`
++        and reads <i> as the layer index -- so only the caches may be varargs. Everything in front
++        has to be named, which is also why the count is fixed at three rather than read from
++        n_e3_layers: EAGLE-3 reads exactly three target layers (low, mid, high), and `fc` is built
++        to match.
++        """
++        assert self.n_e3_layers == 3, (
++            f"this forward names three target hidden inputs; config says {self.n_e3_layers}"
++        )
++        target_hidden = [h_0, h_1, h_2]
++
++        freqs_cos = self.freqs_cos[input_pos][0]
++        freqs_sin = self.freqs_sin[input_pos][0]
++
++        # depth 0 supplies target hiddens and a zero g_direct; deeper rows do the reverse. fc has no
++        # bias, so the unused side contributes exactly zero.
++        g = g_direct
++        for fc_i, h_i in zip(self.fc, target_hidden):
++            g = g + fc_i(h_i)
++
++        output_k_cache = []
++        output_v_cache = []
++        hidden_states = None
++        for ind, decoder_layer in enumerate(self.layers):
++            hidden_states, k, v = decoder_layer(
++                tok_embd,
++                g,
++                freqs_cos=freqs_cos,
++                freqs_sin=freqs_sin,
++                atten_mask=atten_mask,
++                k_caches=args[ind],
++                v_caches=args[self.n_layers + ind],
++            )
++            output_k_cache.extend(k)
++            output_v_cache.extend(v)
++
++        logits = self.output(self.norm(hidden_states))
++        if self.logits_scaling:
++            logits = logits / self.logits_scaling
++        if self.output_cache:
++            return logits, hidden_states, output_k_cache, output_v_cache
++        return logits, hidden_states
++
++    def get_example_inputs(self):
++        b = self.max_batch_size
++        target_hidden = [
++            torch.randn((b, self.ar_len, self.dim), dtype=torch.float32)
++            for _ in range(self.n_e3_layers)
++        ]
++        g_direct = torch.randn((b, self.ar_len, self.dim), dtype=torch.float32)
++        tok_embd = torch.randn((b, self.ar_len, self.dim), dtype=torch.float32)
++        cache_len = self.max_context_len - self.ar_len
++        atten_mask = AttentionMask(
++            CausalAttentionMask(b, self.ar_len, self.max_context_len)
++        )
++        pos = torch.zeros((b, self.ar_len), dtype=torch.int32)
++        k_cache, v_cache = [], []
++        for _ in range(self.n_layers):
++            k_cache.append(torch.zeros(b, self.n_kv_heads, self.head_dim, cache_len))
++            v_cache.append(torch.zeros(b, self.n_kv_heads, cache_len, self.head_dim))
++        # Nested, in the shape the wrapper's export_input builder indexes positionally; the model
++        # itself takes the flattened version that builder produces.
++        return (target_hidden + [g_direct], tok_embd, atten_mask, pos, k_cache, v_cache)
++
++    def get_attn_mask_template(self):
++        return self.get_example_inputs()[2]
++
++    def get_metadata(self):
++        meta = super().get_metadata()
++        meta["n_e3_layers"] = self.n_e3_layers
++        meta["target_vocab_size"] = self.target_vocab_size
 +        return meta
 diff --git a/examples/qualcomm/oss_scripts/llama/model/static_llama.py b/examples/qualcomm/oss_scripts/llama/model/static_llama.py
 index dc70e2c..0ec42eb 100755
@@ -2084,7 +2841,7 @@ index 653b270..96d45d3 100644
  
          self.tokenizer = None
 diff --git a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
-index 1fc0816..cdec4e2 100644
+index 1fc0816..cf5ebe9 100644
 --- a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
 +++ b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
 @@ -25,6 +25,7 @@ from executorch.backends.qualcomm.utils.check_qnn_version import (
@@ -2113,14 +2870,14 @@ index 1fc0816..cdec4e2 100644
 +    # A speculative-decoding draft head needs two shape parameters that no ordinary decoder has:
 +    # how many committed rows travel with each block (n_inject) and how many target layers were
 +    # concatenated to form its input (n_target_layers). Both are fixed at export time.
-+    for attr in ("n_inject", "n_target_layers"):
++    for attr in ("n_inject", "n_target_layers", "n_e3_layers", "target_vocab_size"):
 +        if hasattr(config, attr):
 +            kwargs[attr] = getattr(config, attr)
      return kwargs
  
  
 diff --git a/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py b/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
-index 264f8b7..453704d 100644
+index 264f8b7..2481b8d 100644
 --- a/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
 +++ b/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
 @@ -5,6 +5,7 @@
@@ -2139,15 +2896,16 @@ index 264f8b7..453704d 100644
      TEXT_DECODER,
      TEXT_ENCODER,
      TOK_EMBEDDING,
-@@ -71,6 +73,7 @@ from executorch.examples.qualcomm.oss_scripts.llama.evaluator.lm_eval_adapter im
+@@ -71,6 +73,8 @@ from executorch.examples.qualcomm.oss_scripts.llama.evaluator.lm_eval_adapter im
  )
  from executorch.examples.qualcomm.oss_scripts.llama.inference import (
      DecoderInference,
 +    DFlashDecoderInference,
++    Eagle3DecoderInference,
      EncoderInference,
  )
  from executorch.examples.qualcomm.oss_scripts.llama.mix_precision_analyzer import (
-@@ -154,6 +157,10 @@ def is_node_src_start_with_name(node: torch.fx.Node, kv_cache_prefix: str) -> bo
+@@ -154,6 +158,10 @@ def is_node_src_start_with_name(node: torch.fx.Node, kv_cache_prefix: str) -> bo
  
  class TextDecoder(Component):
  
@@ -2158,7 +2916,7 @@ index 264f8b7..453704d 100644
      def __init__(
          self,
          control_args: argparse.Namespace,
-@@ -236,23 +243,51 @@ class TextDecoder(Component):
+@@ -236,23 +244,77 @@ class TextDecoder(Component):
                  shares=self.config.num_sharding,
                  pattern=self._get_sharding_get_pattern(),
                  layer_prefix_offsets=layer_prefix_offsets,
@@ -2173,25 +2931,29 @@ index 264f8b7..453704d 100644
 +        # A DFlash draft head takes seven graph inputs, and two of them are the target's hidden
 +        # states, which this loop cannot produce -- the target is not the model being exported.
 +        # They are replayed from an offline dump instead.
++        n_e3_layers = getattr(self.config, "n_e3_layers", None)
 +        n_inject = getattr(self.config, "n_inject", None)
-+        if self.decoder is not None and n_inject is not None:
++        if self.decoder is not None and n_e3_layers is not None:
++            # An EAGLE-3 draft reads the target's hidden states too, at three shard boundaries
++            # rather than five, and additionally has to be calibrated on its own recurrent output --
++            # see Eagle3DecoderInference.
 +            dump = getattr(self.control_args, "dflash_hidden", None)
 +            if not dump:
 +                raise ValueError(
-+                    "a DFlash draft export needs --dflash_hidden: the target hidden states its "
++                    "an EAGLE-3 draft export needs --dflash_hidden: the target hidden states its "
 +                    "observers calibrate on cannot come from token prompts. Produce one with "
-+                    "dump_target_hidden.py against the TARGET model."
++                    "dump_target_hidden.py against the TARGET model, at the layers this draft "
++                    "reads."
 +                )
-+            self._decoder_inference = DFlashDecoderInference(
++            self._decoder_inference = Eagle3DecoderInference(
                  get_example_inputs=self.get_example_inputs,
 -                audio_token_id=self.meta.get("audio_token_id", None),
 -                image_token_id=self.meta.get("image_token_id", None),
 +                hidden_dump=dump,
-+                n_inject=n_inject,
-+                n_target_layers=getattr(self.config, "n_target_layers", 5),
-+                mask_token_id=getattr(self.config, "mask_token_id", None),
-+                # The table is no longer a graph input, so calibration has to do the lookup the
-+                # runtime does on the host. It stays reachable on the module; forward not touching
++                n_e3_layers=n_e3_layers,
++                recurrent_depth=getattr(self.control_args, "e3_recurrent_depth", 5),
++                # The draft owns no table; this is the target's, carried on the module so
++                # calibration can do the lookup the runtime does on the host. forward not touching
 +                # it is what keeps it out of the artifact.
 +                embedding=getattr(self.decoder, "tok_embeddings", None),
                  max_context_len=self.meta["get_max_context_len"],
@@ -2201,6 +2963,28 @@ index 264f8b7..453704d 100644
 -            if self.decoder is not None
 -            else None
 -        )
++        elif self.decoder is not None and n_inject is not None:
++            dump = getattr(self.control_args, "dflash_hidden", None)
++            if not dump:
++                raise ValueError(
++                    "a DFlash draft export needs --dflash_hidden: the target hidden states its "
++                    "observers calibrate on cannot come from token prompts. Produce one with "
++                    "dump_target_hidden.py against the TARGET model."
++                )
++            self._decoder_inference = DFlashDecoderInference(
++                get_example_inputs=self.get_example_inputs,
++                hidden_dump=dump,
++                n_inject=n_inject,
++                n_target_layers=getattr(self.config, "n_target_layers", 5),
++                mask_token_id=getattr(self.config, "mask_token_id", None),
++                # The table is no longer a graph input, so calibration has to do the lookup the
++                # runtime does on the host. It stays reachable on the module; forward not touching
++                # it is what keeps it out of the artifact.
++                embedding=getattr(self.decoder, "tok_embeddings", None),
++                max_context_len=self.meta["get_max_context_len"],
++                max_batch_size=self.meta["get_max_batch_size"],
++                use_i64_token=self.control_args.embedding_quantize is not None,
++            )
 +        else:
 +            self._decoder_inference = (
 +                DecoderInference(
@@ -2217,7 +3001,7 @@ index 264f8b7..453704d 100644
  
      def _get_sharding_get_pattern(self):
          if self.control_args.decoder_model == "gemma4-e2b":
-@@ -358,9 +393,36 @@ class TextDecoder(Component):
+@@ -358,9 +420,36 @@ class TextDecoder(Component):
          decoder.load_state_dict(state_dict, strict=True, assign=True)
  
          if any([self.config.r1, self.config.r2]):
@@ -2257,7 +3041,7 @@ index 264f8b7..453704d 100644
              )
  
          # perform model transformation
-@@ -377,6 +439,46 @@ class TextDecoder(Component):
+@@ -377,6 +466,46 @@ class TextDecoder(Component):
              dtype_override = DType[self.control_args.dtype_override]
              decoder = decoder.to(dtype_override.to_torch_dtype())
  
@@ -2304,7 +3088,7 @@ index 264f8b7..453704d 100644
          # check embedding fallback
          if self.control_args.embedding_quantize:
              self.passes_job[I64toI32][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY][
-@@ -467,13 +569,25 @@ class TextDecoder(Component):
+@@ -467,13 +596,37 @@ class TextDecoder(Component):
          # get example input
          self.example_input = decoder.get_example_inputs()
          self.get_example_inputs = decoder.get_example_inputs
@@ -2315,7 +3099,19 @@ index 264f8b7..453704d 100644
 -            *(self.example_input[3] if decoder.use_kv_cache else []),  # k_caches
 -            *(self.example_input[4] if decoder.use_kv_cache else []),  # v_caches
 -        )
-+        if getattr(decoder, "n_target_layers", None):
++        if getattr(decoder, "n_e3_layers", None):
++            # EAGLE-3 draft: (target_hidden list + g_direct, embeddings, attn_mask, pos, k, v).
++            # There is no pos_ctx: unlike a DFlash draft, every row here is an ordinary position --
++            # the committed-token branch that needed its own positions does not exist.
++            self.export_input = (
++                *self.example_input[0],   # h_0..h_2, then g_direct
++                self.example_input[1],    # token embeddings
++                *self.example_input[2],   # attn_mask
++                self.example_input[3],    # positions
++                *self.example_input[4],   # k_caches
++                *self.example_input[5],   # v_caches
++            )
++        elif getattr(decoder, "n_target_layers", None):
 +            # DFlash draft: (target_hidden list, tokens, attn_mask, pos, pos_ctx, k list, v list)
 +            self.export_input = (
 +                *self.example_input[0],   # one hidden tensor per target layer
@@ -2337,18 +3133,32 @@ index 264f8b7..453704d 100644
          self.io_shape = {
              # logit output
              (
-@@ -515,6 +629,10 @@ class TextDecoder(Component):
+@@ -482,6 +635,11 @@ class TextDecoder(Component):
+                 decoder.vocab_size,
+             ),
+         }
++        # An EAGLE-3 draft has hidden states on both sides of the graph -- four in, and the
++        # pre-norm hidden out that becomes the next depth's `g`. They are deliberately NOT added to
++        # io_shape: tagging them io_type hands rms_norm a UInt16 tensor and the lowering fails
++        # outright ("rms_norm not implemented for UInt16"). They stay float, as the DFlash draft's
++        # five hidden inputs already do.
+         # shape of k caches and v caches
+         if self.control_args.decoder_model == "gemma4-e2b":
+             # Gemma 4 has per-layer head_dim: sliding=256, full=512
+@@ -515,6 +673,12 @@ class TextDecoder(Component):
      @property
      def attn_mask(self):
          """Attention mask for this decoder graph, used as a schema for dataset construction."""
-+        # Position 1 holds the mask for every decoder whose first input is the token tensor. A
-+        # DFlash draft puts one hidden tensor per target layer in front, so its mask sits at 2.
-+        if getattr(self.config, "n_target_layers", None):
++        # Position 1 holds the mask for every decoder whose first input is the token tensor. Both
++        # draft heads put their hidden-state inputs in front, so their mask sits at 2.
++        if getattr(self.config, "n_target_layers", None) or getattr(
++            self.config, "n_e3_layers", None
++        ):
 +            return self.example_input[2]
          return self.example_input[1]
  
      def _save_logits_quant_attrs(self):
-@@ -823,6 +941,48 @@ class TextDecoder(Component):
+@@ -823,6 +987,48 @@ class TextDecoder(Component):
              del graph_module
              gc.collect()
  
@@ -2397,7 +3207,7 @@ index 264f8b7..453704d 100644
              if self.apply_embedding:
                  self.tok_embedding = convert_pt2e(self.tok_embedding)
  
-@@ -1098,15 +1258,25 @@ class HybridTextDecoder(Component):
+@@ -1098,15 +1304,25 @@ class HybridTextDecoder(Component):
                      override_kv_cache=False,
                  )
  
@@ -2432,7 +3242,7 @@ index 264f8b7..453704d 100644
  
              if self.apply_embedding:
                  self._encoding_override(
-@@ -1327,6 +1497,7 @@ class Modality(Component):
+@@ -1327,6 +1543,7 @@ class Modality(Component):
                  self.num_layers,
                  shares=self.config.num_sharding,
                  pattern=self._get_sharding_get_pattern(),

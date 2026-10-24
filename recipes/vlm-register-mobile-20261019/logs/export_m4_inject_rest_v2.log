@@ -1,0 +1,13 @@
+REGISTER_MOBILE_INJECT_EXPORTED deep-dynreg8-20k-seed42-inject256
+Traceback (most recent call last):
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 121, in <module>
+    main(argv or ['none-20k-seed42', 'norm32-20k-seed42', 'dynreg8-20k-seed42', 'norm8-20k-seed42', 'deep-dynreg8-20k-seed42'], context_len, limit, inject_rows)
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 10, in main
+    if inject_rows: return main_inject(arms, inject_rows, phase_limit_s)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 91, in main_inject
+    run('inject-audit', [PY, str(S/'check_vlm_register_mobile_inject.py'), '--arm', arm, '--inject-rows', str(inject_rows)], OUT/f'{arm}{sfx}-audit.log')
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 82, in run
+    assert child.returncode == 0, f'{phase} failed; see {log}'
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError: inject-audit failed; see /home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/export/none-20k-seed42-inject256-audit.log

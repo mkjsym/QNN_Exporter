@@ -1,0 +1,12 @@
+Traceback (most recent call last):
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 121, in <module>
+    main(argv or ['none-20k-seed42', 'norm32-20k-seed42', 'dynreg8-20k-seed42', 'norm8-20k-seed42', 'deep-dynreg8-20k-seed42'], context_len, limit, inject_rows)
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 10, in main
+    if inject_rows: return main_inject(arms, inject_rows, phase_limit_s)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 93, in main_inject
+    run('inject-export', [PY, '-u', str(S/'export_vlm_register_mobile_inject.py'), '--inject_rows', str(inject_rows), '--decoder_model', 'qwen3-4b-dflash-w4', '--model_mode', 'hybrid',
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 82, in run
+    assert child.returncode == 0, f'{phase} failed; see {log}'
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError: inject-export failed; see /home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/export/full-20k-seed42-inject256-export.log

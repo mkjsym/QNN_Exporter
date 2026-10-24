@@ -1,0 +1,620 @@
+diff --git a/backends/qualcomm/qnn_preprocess.py b/backends/qualcomm/qnn_preprocess.py
+index a267dc2..58c262c 100644
+--- a/backends/qualcomm/qnn_preprocess.py
++++ b/backends/qualcomm/qnn_preprocess.py
+@@ -5,7 +5,11 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ import logging
++import os
++import subprocess
++import sys
+ from collections import defaultdict
++from pathlib import Path
+ from typing import Dict, final, List
+ 
+ import torch  # noqa: F401
+@@ -224,6 +228,26 @@ class QnnBackend(BackendDetails):
+                 assert (
+                     len(qnn_context_binary) != 0
+                 ), "Failed to generate Qnn context binary."
++                # MobiSpec consumes these contexts directly. Persist each shard before
++                # PTE serialization so a packaging failure cannot discard a long compile.
++                if dump_dir := os.environ.get("QNN_VLM_CONTEXT_DUMP_DIR"):
++                    from executorch.backends.qualcomm.python import PyQnnManagerAdaptor
++
++                    binary = PyQnnManagerAdaptor.StripProtocol(bytes(qnn_context_binary))
++                    if len(binary) == 0:
++                        raise RuntimeError("Expected a compiled QNN context, not a DLC")
++                    path = Path(dump_dir) / f"forward_{i}.bin"
++                    if path.exists():
++                        raise FileExistsError(path)
++                    temporary = path.with_suffix(".bin.tmp")
++                    with temporary.open("xb") as output:
++                        output.write(binary)
++                        output.flush()
++                        os.fsync(output.fileno())
++                    temporary.rename(path)
++                    logger.info("Saved compiled context: %s (%d bytes)", path, len(binary))
++                    if validator := os.environ.get("QNN_VLM_CONTEXT_VALIDATOR"):
++                        subprocess.run([sys.executable, validator, str(path)], check=True)
+                 qnn_manager.DestroyContext()
+                 # methods should share the same context binary for current partition
+                 for key in edge_programs.keys():
+diff --git a/examples/models/qwen3/config/vl_4b_config.json b/examples/models/qwen3/config/vl_4b_config.json
+new file mode 100644
+index 0000000..8636f11
+--- /dev/null
++++ b/examples/models/qwen3/config/vl_4b_config.json
+@@ -0,0 +1,16 @@
++{
++  "dim": 2560,
++  "hidden_dim": 9728,
++  "n_heads": 32,
++  "head_dim": 128,
++  "n_kv_heads": 8,
++  "n_layers": 36,
++  "norm_eps": 1e-6,
++  "rope_theta": 5000000.0,
++  "use_scaled_rope": false,
++  "vocab_size": 151936,
++  "use_hf_rope": true,
++  "attention_qkv_bias": false,
++  "use_qk_norm": true,
++  "qk_norm_before_rope": true
++}
+diff --git a/examples/qualcomm/oss_scripts/llama/__init__.py b/examples/qualcomm/oss_scripts/llama/__init__.py
+index 6fea173..e43edcd 100644
+--- a/examples/qualcomm/oss_scripts/llama/__init__.py
++++ b/examples/qualcomm/oss_scripts/llama/__init__.py
+@@ -121,8 +121,12 @@ from executorch.examples.qualcomm.oss_scripts.llama.model.dflash_draft import (
+ from executorch.examples.qualcomm.oss_scripts.llama.model.eagle3_draft import (  # noqa: E402
+     Eagle3DraftModel,
+ )
++from executorch.examples.qualcomm.oss_scripts.llama.model.qwen3_vl import Qwen3VLTargetModel, Qwen3VLDeepRegisterTargetModel
+ 
+ LLM_VARIANT_ARCHS: Dict[str, LlamaModel] = {
++    "qwen3-vl-4b-dflash": Qwen3VLTargetModel,
++    "qwen3-vl-4b-dflash-deep": Qwen3VLDeepRegisterTargetModel,
++    "qwen3-vl-4b-eagle3": Qwen3VLTargetModel,
+     "qwen3-4b-dflash": DFlashDraftModel,
+     "qwen3-4b-dflash-w4": DFlashDraftModel,
+     "qwen3-4b-dflash-w4a8": DFlashDraftModel,
+@@ -724,6 +728,64 @@ class Qwen3_4B_Sqnr(LLMModelConfig):
+     quant_recipe = Qwen3_4B_SqnrQuantRecipe
+ 
+ 
++@register_llm_model("qwen3-vl-4b-dflash")
++@dataclass(init=False, frozen=True)
++class Qwen3_VL_4B_DFlash(LLMModelConfig):
++    vlm_input = True
++    repo_id: str = "Qwen/Qwen3-VL-4B-Instruct"
++    params_path: str = os.path.join(BASE_DIR, "../../../models/qwen3/config/vl_4b_config.json")
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_4B_SqnrQuantRecipe
++
++
++@register_llm_model("qwen3-vl-4b-dflash-deep")
++@dataclass(init=False, frozen=True)
++class Qwen3_VL_4B_DFlash_Deep(LLMModelConfig):
++    """Same target and recipe as qwen3-vl-4b-dflash plus the baked per-layer register prompts (vlm_prompt_slot input)."""
++    vlm_input = True
++    repo_id: str = "Qwen/Qwen3-VL-4B-Instruct"
++    params_path: str = os.path.join(BASE_DIR, "../../../models/qwen3/config/vl_4b_config.json")
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 6
++    shard_layers = [2, 10, 18, 26, 34]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_4B_SqnrQuantRecipe
++
++
++@register_llm_model("qwen3-vl-4b-eagle3")
++@dataclass(init=False, frozen=True)
++class Qwen3_VL_4B_Eagle3(LLMModelConfig):
++    vlm_input = True
++    repo_id: str = "Qwen/Qwen3-VL-4B-Instruct"
++    params_path: str = os.path.join(BASE_DIR, "../../../models/qwen3/config/vl_4b_config.json")
++    convert_weights = convert_qwen3_weights
++    transform_weight = False
++    instruct_model = True
++    num_sharding = 4
++    shard_layers = [2, 18, 33]
++    masked_softmax = True
++    seq_mse_candidates = 0
++    r1 = False
++    r2 = False
++    r3 = True
++    quant_recipe = Qwen3_4B_SqnrQuantRecipe
++
++
+ @register_llm_model("qwen3-4b-sqnr-e3")
+ @dataclass(init=False, frozen=True)
+ class Qwen3_4B_Sqnr_E3(LLMModelConfig):
+diff --git a/examples/qualcomm/oss_scripts/llama/decoder_constants.py b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
+index ab42409..70b75ab 100644
+--- a/examples/qualcomm/oss_scripts/llama/decoder_constants.py
++++ b/examples/qualcomm/oss_scripts/llama/decoder_constants.py
+@@ -64,6 +64,9 @@ DECODER_MODEL_VERSION = {
+     "qwen3-4b-kv16-mse": "qwen3",
+     "qwen3-4b-kv16-hist": "qwen3",
+     "qwen3-4b-sqnr": "qwen3",
++    "qwen3-vl-4b-dflash": "qwen3",
++    "qwen3-vl-4b-dflash-deep": "qwen3",
++    "qwen3-vl-4b-eagle3": "qwen3",
+     "qwen3-4b-sqnr-e3": "qwen3",
+     "qwen3-4b-r2": "qwen3",
+     "qwen3-4b-lc": "qwen3",
+diff --git a/examples/qualcomm/oss_scripts/llama/inference/qwen3_vl.py b/examples/qualcomm/oss_scripts/llama/inference/qwen3_vl.py
+new file mode 100644
+index 0000000..1e539e7
+--- /dev/null
++++ b/examples/qualcomm/oss_scripts/llama/inference/qwen3_vl.py
+@@ -0,0 +1,127 @@
++"""Calibrate on actual mtmd image embeddings and DeepStack features.
++
++Each calibration sample replays one complete fixture, chunking exactly like the
++runtime and retaining KV only within that prompt. Token-only calibration is refused.
++"""
++import json
++import os
++from pathlib import Path
++
++import numpy as np
++import torch
++
++from executorch.examples.qualcomm.oss_scripts.llama.masking_utils import PADDING_MASK_VALUE
++
++
++class Qwen3VLDecoderInference:
++    def __init__(self, get_example_inputs, fixtures):
++        if not fixtures:
++            raise ValueError("Qwen3-VL requires --vlm_calibration with real image fixture JSON files")
++        ex = get_example_inputs()
++        if len(ex) not in (9, 10) or ex[0].shape[0] != 1:
++            raise ValueError("Qwen3-VL calibration requires a batch-1 explicit multimodal interface")
++        self.ar_len, self.dim = ex[0].shape[1:]
++        self._default_attn_mask, self._k, self._v = ex[1], ex[-2], ex[-1]
++        self._slot = ex[7] if len(ex) == 10 else None   # deep-register variant: per-row one-hot slot
++        # Deep-register variant: every fixture is followed by its K register rows (the drafter's register table as the
++        # embedding, zero DeepStack, text positions continuing the page, slot k one-hot) so the baked prompt path is
++        # calibrated on real prompt values. The first export calibrated with zero slots and the prompts did not survive
++        # quantization (device deep arm at the none-arm level, 2026-10-19).
++        self._registers = None
++        registers = os.environ.get("QNN_VLM_CALIB_REGISTERS")
++        if self._slot is not None:
++            if not registers:
++                raise ValueError("deep-register calibration needs QNN_VLM_CALIB_REGISTERS (f32 [K, dim] register table)")
++            k = int(self._slot.shape[-1])
++            data = np.fromfile(registers, dtype="<f4")
++            if data.size != k * self.dim or not np.isfinite(data).all():
++                raise ValueError(f"register table must be f32 [{k}, {self.dim}]: {registers}")
++            self._registers = torch.from_numpy(data.reshape(k, self.dim).copy())
++        elif registers:
++            raise ValueError("QNN_VLM_CALIB_REGISTERS is only for the deep-register variant")
++        self._fixtures = []
++        self._slot_index = []
++        for name in fixtures:
++            path = Path(name)
++            meta = json.loads(path.read_text())
++            if meta.get("format_version") != 1 or meta.get("dim") != self.dim or meta.get("image_rows", 0) <= 0:
++                raise ValueError(f"not a Qwen3-VL image fixture: {path}")
++            prefix = path.with_suffix("")
++            values = []
++            for role in ("vlm_embd", "vlm_rope_cos", "vlm_rope_sin", "vlm_deepstack_0", "vlm_deepstack_1", "vlm_deepstack_2"):
++                dim = 64 if "rope" in role else self.dim
++                data = np.fromfile(str(prefix) + f".{role}.f32", dtype="<f4")
++                if data.size != meta["rows"] * dim or not np.isfinite(data).all():
++                    raise ValueError(f"malformed fixture tensor: {prefix}.{role}")
++                values.append(torch.from_numpy(data.reshape(meta["rows"], dim)))
++            slot_index = torch.full((meta["rows"],), -1, dtype=torch.long)
++            if self._registers is not None:
++                positions = np.fromfile(str(prefix) + ".positions.i32", dtype="<i4")
++                if positions.size != meta["rows"] * 3:
++                    raise ValueError(f"malformed fixture positions: {prefix}")
++                last = int(positions.reshape(meta["rows"], 3)[-1].max())
++                k = self._registers.shape[0]
++                q = torch.arange(last + 1, last + 1 + k, dtype=torch.float64)[:, None]
++                inv = 5e6 ** (-torch.arange(0, meta["head_dim"], 2, dtype=torch.float64) / meta["head_dim"])   # Qwen3-VL text rows: all MRoPE axes equal
++                check_q = torch.tensor([float(last)])[:, None]
++                if (torch.cos(check_q * inv).float() - values[1][-1]).abs().max() > 1e-3:
++                    raise ValueError(f"RoPE synthesis does not reproduce the fixture's last row: {prefix}")
++                extra = [self._registers, torch.cos(q * inv).float(), torch.sin(q * inv).float()] + [torch.zeros(k, self.dim)] * 3
++                values = [torch.cat((v, e), 0) for v, e in zip(values, extra)]
++                slot_index = torch.cat((slot_index, torch.arange(k)))
++            if values[0].shape[0] > self._k[0].shape[-1]:
++                raise ValueError("fixture exceeds this graph's persistent KV capacity")
++            self._fixtures.append(values)
++            self._slot_index.append(slot_index)
++        self._cursor = 0
++
++    def _inputs(self, fixture, offset, keys, values, slot_index=None):
++        n = min(self.ar_len, fixture[0].shape[0] - offset)
++        data = []
++        for j, tensor in enumerate(fixture):
++            padded = torch.full((self.ar_len, tensor.shape[1]), 1.0 if j == 1 else 0.0)
++            padded[:n] = tensor[offset:offset + n]
++            data.append(padded if j in (1, 2) else padded.unsqueeze(0))
++        cache_len = keys[0].shape[-1]
++        mask = torch.full((1, 1, self.ar_len, cache_len + self.ar_len), PADDING_MASK_VALUE)
++        mask[..., :offset] = 0
++        for row in range(self.ar_len):
++            mask[..., row, cache_len:cache_len + min(row + 1, n)] = 0
++        extra = ()
++        if self._slot is not None:
++            slot = torch.zeros_like(self._slot)
++            if slot_index is not None:
++                for row in range(n):
++                    k = int(slot_index[offset + row])
++                    if k >= 0:
++                        slot[0, row, k] = 1.0
++            extra = (slot,)
++        return (data[0], mask, *data[1:], *extra, *keys, *values), n
++
++    def make_forward_fn(self):
++        def forward(model, model_inputs):
++            fixture = self._fixtures[self._cursor % len(self._fixtures)]
++            slot_index = self._slot_index[self._cursor % len(self._fixtures)]
++            self._cursor += 1
++            keys, values = [torch.zeros_like(k) for k in self._k], [torch.zeros_like(v) for v in self._v]
++            logits = []
++            for offset in range(0, fixture[0].shape[0], self.ar_len):
++                args, n = self._inputs(fixture, offset, keys, values, slot_index)
++                out = model(*args)
++                logits.append(out[0][:, :n])
++                flat = []
++                for item in out[1:]:
++                    flat.extend(item) if isinstance(item, (tuple, list)) else flat.append(item)
++                half = len(flat) // 2
++                if half != len(keys):
++                    raise ValueError("Qwen3-VL calibration KV output count mismatch")
++                for i in range(half):
++                    keys[i][..., offset:offset + n] = flat[i][..., :n].detach()
++                    values[i][..., offset:offset + n, :] = flat[half + i][..., :n, :].detach()
++            return torch.cat(logits, dim=1)
++        return forward
++
++    @torch.no_grad()
++    def predict_step(self, module, input_ids, attn_mask=None, hidden_states=(), tok_embedding=None):
++        # PTQStrategy calls predict_step, so replay the complete image prefix here too.
++        return self.make_forward_fn()(module, {"input_ids": input_ids})
+diff --git a/examples/qualcomm/oss_scripts/llama/llama.py b/examples/qualcomm/oss_scripts/llama/llama.py
+index d309547..910791c 100755
+--- a/examples/qualcomm/oss_scripts/llama/llama.py
++++ b/examples/qualcomm/oss_scripts/llama/llama.py
+@@ -608,6 +608,10 @@ def _build_parser():
+         help="Number of examples to calibrate in few-shot context",
+     )
+ 
++    parser.add_argument(
++        "--vlm_calibration", nargs="+", default=None,
++        help="Qwen3-VL image fixture JSON paths produced by llama-qnn-vlm-prepare.",
++    )
+     parser.add_argument(
+         "--dflash_hidden",
+         help="Path to a target-hidden dump produced by dump_target_hidden.py. Required when "
+diff --git a/examples/qualcomm/oss_scripts/llama/model/qwen3_vl.py b/examples/qualcomm/oss_scripts/llama/model/qwen3_vl.py
+new file mode 100644
+index 0000000..41b572d
+--- /dev/null
++++ b/examples/qualcomm/oss_scripts/llama/model/qwen3_vl.py
+@@ -0,0 +1,179 @@
++import os
++# Copyright (c) Qualcomm Innovation Center, Inc.
++# All rights reserved.
++# Licensed under the BSD-style license in the root LICENSE file.
++
++"""Qwen3-VL text decoder with explicit embedding, DeepStack and rotary inputs.
++
++The vision encoder runs separately. Sequence-order attention masks and physical KV
++slots never use the compressed multimodal rotary coordinates.
++"""
++
++import re
++
++import numpy as np
++import torch
++
++from executorch.examples.qualcomm.oss_scripts.llama.model.static_llama import (
++    LlamaDecoderLayer,
++    LlamaModel,
++    LlamaModelWithoutEmbedding,
++)
++
++
++def interleaved_mrope(positions: torch.Tensor, head_dim=128, theta=5_000_000.0):
++    """positions: [rows, 3] in time/height/width order; output: [rows, 64]."""
++    if head_dim != 128 or theta != 5_000_000.0:
++        raise ValueError("Qwen3-VL-4B requires head_dim=128, theta=5e6")
++    if positions.ndim != 2 or positions.shape[1] != 3:
++        raise ValueError("expected [rows,3] rotary coordinates")
++    freq = torch.arange(head_dim // 2, device=positions.device)
++    axes = torch.where(freq < 60, freq % 3, 0)
++    angles = positions[:, axes].float() * theta ** (-2.0 * freq.float() / head_dim)
++    return angles.cos(), angles.sin()
++
++
++class Qwen3VLDecoderLayer(LlamaDecoderLayer):
++    def forward(self, x, freqs_cos, freqs_sin, atten_mask, k_caches=None, v_caches=None,
++                deepstack=None):
++        hidden, k, v = super().forward(x, freqs_cos, freqs_sin, atten_mask, k_caches, v_caches)
++        # Keep the addition in this layer's scope: the shard boundary must capture AFTER DeepStack.
++        return (hidden + deepstack if deepstack is not None else hidden), k, v
++
++
++class Qwen3VLTargetModel(LlamaModelWithoutEmbedding):
++    is_qwen3_vl = True
++    decoder_layer_class = Qwen3VLDecoderLayer
++
++    def forward(self, vlm_embd, atten_mask, vlm_rope_cos, vlm_rope_sin,
++                vlm_deepstack_0, vlm_deepstack_1, vlm_deepstack_2, *args):
++        hidden = vlm_embd
++        deepstack = (vlm_deepstack_0, vlm_deepstack_1, vlm_deepstack_2)
++        keys, values = [], []
++        for i, layer in enumerate(self.layers):
++            hidden, k, v = layer(
++                hidden, freqs_cos=vlm_rope_cos, freqs_sin=vlm_rope_sin,
++                atten_mask=atten_mask,
++                k_caches=args[i] if self.use_kv_cache else None,
++                v_caches=args[self.n_layers + i] if self.use_kv_cache else None,
++                deepstack=deepstack[i] if i < 3 else None,
++            )
++            keys.extend(k)
++            values.extend(v)
++        logits = self.output(self.norm(hidden))
++        return (logits, keys, values) if self.output_cache else logits
++
++    def get_example_inputs(self):
++        if not self.use_kv_cache:
++            raise ValueError("Qwen3-VL export requires the explicit KV interface")
++        # The embedding-free base uses max_seq_len for caches; QNN IO metadata uses
++        # max_context_len. Keep the actual tensors aligned with the metadata.
++        _, mask, _, keys, values = LlamaModel.get_example_inputs(self)
++        embd = torch.zeros(self.max_batch_size, self.ar_len, self.dim)
++        cos = torch.ones(self.ar_len, self.head_dim // 2)
++        sin = torch.zeros_like(cos)
++        return embd, mask, cos, sin, *(torch.zeros_like(embd) for _ in range(3)), keys, values
++
++    def get_metadata(self):
++        return {**super().get_metadata(), "qwen3_vl_input_version": 1, "n_deepstack": 3}
++
++
++class Qwen3VLDeepRegisterTargetModel(Qwen3VLTargetModel):
++    """Qwen3-VL target with learned per-layer register prompts (MobiSpec deep-dynreg8): rows whose
++    `vlm_prompt_slot` one-hot is set get `slot @ layer_prompts[i-1]` added at the input of layers
++    1..33. Tree/prompt rows carry a zero slot and see exactly the plain graph. The prompts come from
++    the f32 file named by QNN_VLM_LAYER_PROMPTS ([33, 8, dim]) at export time and are baked in as
++    constants; the slot tensor is the only new graph input."""
++    n_vlm_extra_inputs = 1
++    prompt_rows = 8
++    prompt_layers = 33
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        path = os.environ.get("QNN_VLM_LAYER_PROMPTS")
++        if not path:
++            raise ValueError("set QNN_VLM_LAYER_PROMPTS to the [33, 8, dim] f32 layer-prompt file")
++        prompts = torch.from_numpy(np.fromfile(path, dtype="<f4").reshape(self.prompt_layers, self.prompt_rows, self.dim).copy())
++        if not torch.isfinite(prompts).all():
++            raise ValueError("non-finite layer prompts")
++        self.register_buffer("layer_prompts", prompts, persistent=False)
++
++    def forward(self, vlm_embd, atten_mask, vlm_rope_cos, vlm_rope_sin,
++                vlm_deepstack_0, vlm_deepstack_1, vlm_deepstack_2, vlm_prompt_slot, *args):
++        hidden = vlm_embd
++        deepstack = (vlm_deepstack_0, vlm_deepstack_1, vlm_deepstack_2)
++        keys, values = [], []
++        for i, layer in enumerate(self.layers):
++            if 1 <= i <= self.prompt_layers:
++                hidden = hidden + torch.matmul(vlm_prompt_slot, self.layer_prompts[i - 1])
++            hidden, k, v = layer(
++                hidden, freqs_cos=vlm_rope_cos, freqs_sin=vlm_rope_sin,
++                atten_mask=atten_mask,
++                k_caches=args[i] if self.use_kv_cache else None,
++                v_caches=args[self.n_layers + i] if self.use_kv_cache else None,
++                deepstack=deepstack[i] if i < 3 else None,
++            )
++            keys.extend(k)
++            values.extend(v)
++        logits = self.output(self.norm(hidden))
++        return (logits, keys, values) if self.output_cache else logits
++
++    def get_example_inputs(self):
++        embd, mask, cos, sin, ds0, ds1, ds2, keys, values = super().get_example_inputs()
++        slot = torch.zeros(self.max_batch_size, self.ar_len, self.prompt_rows)
++        return embd, mask, cos, sin, ds0, ds1, ds2, slot, keys, values
++
++    def get_metadata(self):
++        return {**super().get_metadata(), "qwen3_vl_deep_prompts": 1, "n_prompt_rows": self.prompt_rows}
++
++
++def load_qwen3_vl_gguf(path):
++    """Load an unquantized GGUF in RAM, avoiding a second 16 GB FP32 checkpoint.
++
++    Qwen3 GGUF conversion preserves HF Q/K split-half ordering. Only names change.
++    Quantized target checkpoints are rejected so export calibration starts from BF16/F16.
++    """
++    import gguf
++
++    reader = gguf.GGUFReader(path)
++    def field(key):
++        if key not in reader.fields:
++            raise ValueError(f"missing GGUF metadata: {key}")
++        return reader.fields[key].contents()
++    expected = {
++        "general.architecture": "qwen3vl",
++        "qwen3vl.embedding_length": 2560,
++        "qwen3vl.block_count": 36,
++        "qwen3vl.rope.freq_base": 5_000_000.0,
++        "qwen3vl.rope.dimension_sections": [24, 20, 20, 0],
++    }
++    for key, value in expected.items():
++        if field(key) != value:
++            raise ValueError(f"incompatible Qwen3-VL-4B metadata: {key}")
++    names = {
++        "attn_q": "attention.wq", "attn_k": "attention.wk",
++        "attn_v": "attention.wv", "attn_output": "attention.wo",
++        "attn_q_norm": "attention.q_norm_fn", "attn_k_norm": "attention.k_norm_fn",
++        "attn_norm": "attention_norm", "ffn_norm": "ffn_norm",
++        "ffn_gate": "feed_forward.w1", "ffn_down": "feed_forward.w2", "ffn_up": "feed_forward.w3",
++    }
++    top = {"token_embd.weight": "tok_embeddings.weight", "output_norm.weight": "norm.weight",
++           "output.weight": "output.weight"}
++    result = {}
++    for tensor in reader.tensors:
++        match = re.fullmatch(r"blk\.(\d+)\.(\w+)\.weight", tensor.name)
++        if tensor.name in top:
++            key = top[tensor.name]
++        elif match and match[2] in names:
++            key = f"layers.{match[1]}.{names[match[2]]}.weight"
++        else:
++            raise ValueError(f"unmapped target tensor: {tensor.name}")
++        if tensor.tensor_type not in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16,
++                                      gguf.GGMLQuantizationType.BF16):
++            raise ValueError(f"export requires unquantized weights: {tensor.name}")
++        array = gguf.quants.dequantize(tensor.data, tensor.tensor_type)
++        result[key] = torch.from_numpy(np.array(array, dtype=np.float32, copy=True))
++    # The 4B model ties the LM head to its input embedding table.
++    if "output.weight" not in result:
++        result["output.weight"] = result["tok_embeddings.weight"]
++    return result
+diff --git a/examples/qualcomm/oss_scripts/llama/model/static_llama.py b/examples/qualcomm/oss_scripts/llama/model/static_llama.py
+index 0ec42eb..b12a1d9 100755
+--- a/examples/qualcomm/oss_scripts/llama/model/static_llama.py
++++ b/examples/qualcomm/oss_scripts/llama/model/static_llama.py
+@@ -669,7 +669,7 @@ class LlamaModel(nn.Module):
+ 
+         self.layers = nn.ModuleList(
+             [
+-                LlamaDecoderLayer(i, config, self.output_new_cache_only)
++                getattr(self, "decoder_layer_class", LlamaDecoderLayer)(i, config, self.output_new_cache_only)
+                 for i in range(config.n_layers)
+             ]
+         )
+diff --git a/examples/qualcomm/oss_scripts/llama/tokenizer.py b/examples/qualcomm/oss_scripts/llama/tokenizer.py
+index 96d45d3..e2b6730 100644
+--- a/examples/qualcomm/oss_scripts/llama/tokenizer.py
++++ b/examples/qualcomm/oss_scripts/llama/tokenizer.py
+@@ -114,7 +114,10 @@ class TokenizerWrapper:
+         return runtime_tokenizer_path, tokenizer
+ 
+     def _from_hf(self):
+-        tokenizer = AutoTokenizer.from_pretrained(self.repo_id)
++        source = self.repo_id
++        if getattr(self.config, "vlm_input", False) and self.control_args.tokenizer_model:
++            source = self.control_args.tokenizer_model
++        tokenizer = AutoTokenizer.from_pretrained(source)
+         chat_template = (
+             tokenizer.apply_chat_template
+             if hasattr(tokenizer, "apply_chat_template") and self._instruct_model
+diff --git a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
+index cf5ebe9..1855397 100644
+--- a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
++++ b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
+@@ -104,6 +104,8 @@ def process_model_args(
+         ar_len = control_args.prefill_ar_len
+     elif mode == Mode.CALIBRATE:
+         ar_len = control_args.max_context_len
++        if getattr(config, "vlm_input", False):
++            ar_len = control_args.prefill_ar_len
+         # A draft head spends part of its window on the committed rows that ride along with each
+         # block, and needs what is left over to hold a real KV cache while calibrating.
+         if getattr(config, "n_inject", None):
+diff --git a/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py b/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+index 2481b8d..47992ed 100644
+--- a/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
++++ b/examples/qualcomm/oss_scripts/llama/wrappers/llm_wrappers.py
+@@ -10,6 +10,7 @@ import gc
+ import inspect
+ import json
+ import logging
++import os
+ import re
+ 
+ from functools import partial
+@@ -186,6 +187,12 @@ class TextDecoder(Component):
+         self.quant_recipe: StaticLLMQuantRecipe = (
+             recipe_cls(mode == Mode.CALIBRATE) if recipe_cls else None
+         )
++        if getattr(config, "vlm_input", False) and os.environ.get("QNN_VLM_KV_BITS", "8") == "16":
++            from executorch.backends.qualcomm.quantizer.custom_annotation import annotate_kv_8bit
++            self.quant_recipe.recipe.custom_quant_annotations = [
++                annotation for annotation in self.quant_recipe.recipe.custom_quant_annotations
++                if annotation is not annotate_kv_8bit
++            ]
+ 
+         # For multimodal embedding
+         self.apply_embedding = apply_embedding
+@@ -255,7 +262,11 @@ class TextDecoder(Component):
+         # They are replayed from an offline dump instead.
+         n_e3_layers = getattr(self.config, "n_e3_layers", None)
+         n_inject = getattr(self.config, "n_inject", None)
+-        if self.decoder is not None and n_e3_layers is not None:
++        if self.decoder is not None and getattr(self.config, "vlm_input", False):
++            from executorch.examples.qualcomm.oss_scripts.llama.inference.qwen3_vl import Qwen3VLDecoderInference
++            self._decoder_inference = Qwen3VLDecoderInference(
++                self.get_example_inputs, getattr(self.control_args, "vlm_calibration", None))
++        elif self.decoder is not None and n_e3_layers is not None:
+             # An EAGLE-3 draft reads the target's hidden states too, at three shard boundaries
+             # rather than five, and additionally has to be calibrated on its own recurrent output --
+             # see Eagle3DecoderInference.
+@@ -334,7 +345,13 @@ class TextDecoder(Component):
+             return None, None
+         tok_embedding, decoder = instance
+         # load parameters for HF models
+-        if self.control_args.checkpoint is None:
++        if getattr(self.config, "vlm_input", False):
++            from executorch.examples.qualcomm.oss_scripts.llama.model.qwen3_vl import load_qwen3_vl_gguf
++            checkpoint = self.control_args.checkpoint
++            if not checkpoint or not str(checkpoint).endswith(".gguf"):
++                raise ValueError("Qwen3-VL currently requires --checkpoint pointing to a BF16/F16 GGUF")
++            state_dict = load_qwen3_vl_gguf(checkpoint)
++        elif self.control_args.checkpoint is None:
+             if self.control_args.decoder_model == "gemma4-e2b":
+                 from executorch.examples.qualcomm.oss_scripts.gemma4.text_decoder.convert_weights import (
+                     remap_keys,
+@@ -596,7 +613,13 @@ class TextDecoder(Component):
+         # get example input
+         self.example_input = decoder.get_example_inputs()
+         self.get_example_inputs = decoder.get_example_inputs
+-        if getattr(decoder, "n_e3_layers", None):
++        if getattr(decoder, "is_qwen3_vl", False):
++            extra = getattr(decoder, "n_vlm_extra_inputs", 0)   # deep-register variant: vlm_prompt_slot after the DeepStack inputs
++            self.export_input = (
++                self.example_input[0], *self.example_input[1], *self.example_input[2:7 + extra],
++                *self.example_input[7 + extra], *self.example_input[8 + extra],
++            )
++        elif getattr(decoder, "n_e3_layers", None):
+             # EAGLE-3 draft: (target_hidden list + g_direct, embeddings, attn_mask, pos, k, v).
+             # There is no pos_ctx: unlike a DFlash draft, every row here is an ordinary position --
+             # the committed-token branch that needed its own positions does not exist.
+@@ -1440,6 +1463,15 @@ class HybridTextDecoder(Component):
+             for ep in edge_prog_mgr._edge_programs.values():
+                 print_delegation_info(ep.graph_module)
+ 
++        if getattr(self.config, "vlm_input", False) and os.environ.get("QNN_VLM_CONTEXT_ONLY") == "1":
++            from pathlib import Path
++            contexts = Path(os.environ["QNN_VLM_CONTEXT_DUMP_DIR"])
++            expected = {f"forward_{i}.bin" for i in range(self.config.num_sharding)}
++            if {p.name for p in contexts.glob("*.bin")} != expected or list(contexts.glob("*.tmp")):
++                raise RuntimeError("incomplete raw VLM contexts")
++            logging.info("Native VLM contexts complete; PTE packaging disabled explicitly")
++            return
++
+         executorch_config = ExecutorchBackendConfig(
+             # For shared buffer, user must pass the memory address
+             # which is allocated by RPC memory to executor runner

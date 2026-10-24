@@ -1,6 +1,6 @@
 # 패치가 ExecuTorch에서 바꾸는 것
 
-`patch/executorch-qnn-export.patch`는 상류 `88a5f60`(2026-08-24) 기준 21개 파일을 건드린다.
+`patch/executorch-qnn-export.patch`는 상류 `88a5f60`(2026-08-24) 기준 26개 파일을 건드린다.
 export는 이 리포가 아니라 ExecuTorch 소스 트리에서 돌기 때문에 이 방식이다 — 포크하지 않는
 이유는 상류가 올라갔을 때 리베이스가 "충돌 해결"이지 "고고학"이 아니길 바라서다.
 
@@ -65,7 +65,34 @@ export 입력 평탄화, 콜레이터 패딩 폭, 마스크의 질의/키 축 �
 CALIBRATE 창 분할. KV 캐시만 `*args`에 남겨야 한다는 제약도 있다 — 탐지가 `args_<i>` 이름으로
 층 인덱스를 읽는다.
 
-### 5. `LLMModelConfig.__str__`의 리스트 포맷
+### 5. EAGLE-3 드래프트 헤드 (`qwen3-4b-eagle3-w4` / `qwen3-8b-eagle3-w4`)
+
+DFlash와 이름만 "드래프트"지 구조가 겹치지 않아 모델 클래스를 따로 썼다: 1층, `fc`가 타깃
+hidden **3개**(7680→2560)를 받고, Q/K/V가 **5120 폭 concat**(정규화된 임베딩 ⊕ 정규화된 g)을
+읽고, q/k norm이 없고, 출력이 축소 vocab 32000 + `d2t`이며, 자체 임베딩 테이블이 없다.
+
+정적 그래프가 두 종류의 `g`를 받아야 한다는 게 설계의 핵심이다. depth 0에서는 타깃 hidden을
+`fc`가 투영하고, depth>0에서는 이 층 자신의 prenorm 출력이 그대로 들어온다. 분기하는 대신
+**둘 다 배선하고 안 쓰는 쪽을 0으로 둔다** — `g = Σ fc_i(h_i) + g_direct`. `fc`에 bias가 없어
+`fc(0)=0`이 정확히 성립하므로 셀렉터도 두 번째 그래프도 필요 없다.
+
+`model/eagle3_draft.py`가 모델, `models/qwen3_eagle3/`가 가중치 변환, `inference/decoder.py`의
+`Eagle3DecoderInference`가 캘리브레이션이다. 드래프트 export에 `--dflash_hidden`이 필요한 것은
+DFlash와 같지만 **읽는 층이 다르다** — EAGLE-3 헤드는 `target_layers = [2, 18, 33]`의 입력
+잔차를 먹으므로 `dump_target_hidden.py --layer-ids 1,17,32`다(스크립트가 `hidden_states[id+1]`을
+읽는다). 타깃도 그 세 층이 샤드 경계여야 한다 — `qwen3-4b-sqnr-e3`가 그 용도다.
+
+⚠️ **캘리브레이션 진입점 함정.** PTQ는 `make_forward_fn`이 아니라 **`predict_step`**을 부른다
+(`quantize/ptq.py`). 재귀 depth 되먹임이 `make_forward_fn`에만 있으면 `g_direct` 관찰자가
+캘리브레이션 내내 0만 보고, 스케일이 무너져 **export가 재귀 입력을 통째로 지운다.** 기기에서는
+depth 0만 맞고 그 이후가 전부 눈이 머는데 아무것도 실패하지 않는다. 그래서 두 진입점을 공통
+`_run()`으로 합쳤다.
+
+⚠️ **hidden IO를 `io_shape`에 넣지 말 것.** `[1, ar, dim]`을 넣으면 lowering이
+`"rms_norm" not implemented for 'UInt16'`으로 죽는다. 빼 두면 prenorm 출력이 FLOAT_32로 나와
+호스트가 역양자화할 필요도 없다.
+
+### 6. `LLMModelConfig.__str__`의 리스트 포맷
 
 `format_value()`가 int를 변환하지 않고 돌려주는데 그 결과를 `join()`에 넣고 있었다.
 `shard_layers` 같은 숫자 리스트가 처음이라 이제야 터진다.

@@ -1,0 +1,18 @@
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 7565.03it/s]
+CALIB doc2-docvqa-07-628 docvqa rows 3150 image 3038
+CALIB doc20k-docvqa-06-156 docvqa rows 1769 image 1666
+CALIB doc20k-docvqa-09-719 docvqa rows 3133 image 3024
+CALIB doc20k-docvqa-10-681 docvqa rows 3059 image 2976
+CALIB doc20k-docvqa-12-446 docvqa rows 3125 image 3024
+CALIB doc20k-docvqa-13-230 docvqa rows 3083 image 2976
+CALIB doc20k-chartqa-00-5902 chartqa rows 595 image 475
+CALIB doc20k-chartqa-00-8521 chartqa rows 519 image 425
+CALIB doc20k-chartqa-01-2197 chartqa rows 548 image 425
+CALIB doc20k-chartqa-01-405 chartqa rows 1121 image 1000
+CALIB doc20k-chartqa-01-6735 chartqa rows 554 image 425
+CALIB doc2-infographic-00-1915 infographic rows 1044 image 935
+CALIB doc2-infographic-00-1917 infographic rows 1033 image 840
+CALIB doc2-infographic-00-922 infographic rows 1037 image 912
+CALIB doc20k-infographic-00-1584 infographic rows 1093 image 920
+CALIB doc20k-infographic-00-397 infographic rows 844 image 752
+CALIBRATION_DONE 16

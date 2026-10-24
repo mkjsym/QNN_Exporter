@@ -78,8 +78,15 @@ python $EXECUTORCH_ROOT/examples/qualcomm/oss_scripts/llama/dump_target_hidden.p
 Before paying for an export, `scripts/sweep_draft_bits.py --ckpt … --hidden …` fake-quantizes the
 weights at 4/5/6/8 bits in seconds. It sees weights only, so read it as an upper bound.
 
-Registered drafts: `qwen3-4b-dflash` (deployed, 16a8w), `qwen3-4b-dflash-w4` (w4a16),
-`qwen3-4b-dflash-w4a8`, `qwen3-4b-dspark` (DSpark-b7, needed by PCTree/DARTree), `qwen3-8b-dflash`.
+Registered drafts: `qwen3-4b-dflash` (16a8w), `qwen3-4b-dflash-w4` (w4a16),
+`qwen3-4b-dflash-w4a8`, `qwen3-4b-dspark` (DSpark-b7, needed by PCTree/DARTree),
+`qwen3-4b-dspark-w4`, `qwen3-8b-dflash`, `qwen3-8b-dflash-w4`, `qwen3-8b-dspark-w4`.
+
+**Bake the w4 variants.** On the 4B target 4-bit weights cost 1.4–2.8% acceptance and make the
+draft call 20–24% cheaper, netting +2.0% (DFlash chain) to +3.6% (DARTree) with a context 25%
+smaller (894 → 671 MB). On the **8B target they are not optional**: the 8-bit draft does not load
+beside a 5.5 GB target on a 12 GB phone — it dies in `QnnContext_createFromBinary` and takes the
+device down with it — while the 4-bit one runs and beats an Adreno draft by 9–11%.
 
 The embedding table is deliberately outside the graph: fp16 on the host, mmapped, 8 rows touched
 per step. Reusing the target GGUF's Q4_0 table instead costs 5 of 8 top-1 agreements.

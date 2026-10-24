@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--layer-prompts", type=Path, default=None, help="dflash-deep: f32 [33, 8, dim] per-layer register prompts baked into the graph")
     parser.add_argument("--calib-registers", type=Path, default=None, help="f32 [8, dim] register table appended to every calibration fixture: dflash-deep with one-hot prompt slots; dflash (plain) without slots, so the plain target's PTQ encodings see the dynamic-register side rows it serves on the device (M6, 2026-10-22)")
     parser.add_argument("--kv-bits", type=int, choices=(8,16), default=8)
+    parser.add_argument("--calib-ar", type=int, default=None, help="rows per PTQ calibration step (default: --ar). Calibrating a 40-row target at 32 gives it the encodings of the 32-row target built from the same fixtures (shared encodings across verification widths)")
     parser.add_argument("--context-only", action="store_true", help="save native contexts without a duplicate PTE container")
     parser.add_argument("--build", type=Path, required=True)
     args = parser.parse_args()
@@ -28,6 +29,8 @@ def main():
     sdk = Path(os.environ["QNN_SDK_ROOT"]).resolve()
     if not 1 < args.ar < args.context:
         parser.error("require 1 < ar < context")
+    if args.calib_ar is not None and not 1 < args.calib_ar < args.context:
+        parser.error("require 1 < calib-ar < context")
     if not args.checkpoint.is_file() or not args.tokenizer.is_dir():
         parser.error("checkpoint/tokenizer path does not exist")
     for name in ("program.fbs", "scalar_type.fbs"):
@@ -87,13 +90,15 @@ def main():
     env["QNN_VLM_CONTEXT_LENGTH"] = str(args.context)
     env["QNN_VLM_PREFILL_AR"] = str(args.ar)
     env["QNN_VLM_KV_BITS"] = str(args.kv_bits)
+    if args.calib_ar is not None:
+        env["QNN_VLM_CALIB_AR"] = str(args.calib_ar)   # read by the patched base_component.py (patch/qwen3-vl.patch)
     env["QNN_VLM_CONTEXT_ONLY"] = "1" if args.context_only else "0"
     (args.artifact / "command.json").write_text(json.dumps({"argv": command,
         "executorch": str(et), "sdk": str(sdk), "vision_backend": "CPU",
         "draft": "unchanged Qwen3-4B " + args.method, "calibration_fixtures": len(args.fixture),
         "layer_prompts": str(args.layer_prompts.resolve()) if args.layer_prompts else None,
         "calib_registers": str(args.calib_registers.resolve()) if args.calib_registers else None,
-        "kv_bits": args.kv_bits, "context_only": args.context_only}, indent=2) + "\n")
+        "kv_bits": args.kv_bits, "context_only": args.context_only, "calib_ar": args.calib_ar or args.ar}, indent=2) + "\n")
     params = json.loads((et / "examples/models/qwen3/config/vl_4b_config.json").read_text())
     params.update(vlm_input_version=1, n_deepstack=3, mrope_sections=[24,20,20])
     params.update(speculative_method=args.method,

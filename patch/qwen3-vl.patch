@@ -530,15 +530,24 @@ index 96d45d3..e2b6730 100644
              tokenizer.apply_chat_template
              if hasattr(tokenizer, "apply_chat_template") and self._instruct_model
 diff --git a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
-index cf5ebe9..1855397 100644
 --- a/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
 +++ b/examples/qualcomm/oss_scripts/llama/wrappers/base_component.py
-@@ -104,6 +104,8 @@ def process_model_args(
+@@ -9,6 +9,7 @@
+ import logging
+ 
+ import math
++import os
+ import time
+ 
+ from dataclasses import dataclass
+@@ -104,6 +105,10 @@
          ar_len = control_args.prefill_ar_len
      elif mode == Mode.CALIBRATE:
          ar_len = control_args.max_context_len
 +        if getattr(config, "vlm_input", False):
-+            ar_len = control_args.prefill_ar_len
++            # QNN_VLM_CALIB_AR calibrates at another graph's row count, so that targets with different prefill_ar_len
++            # (32-row and 40-row verification graphs) get one shared set of encodings (QNN_Exporter --calib-ar).
++            ar_len = int(os.environ.get("QNN_VLM_CALIB_AR") or control_args.prefill_ar_len)
          # A draft head spends part of its window on the committed rows that ride along with each
          # block, and needs what is left over to hold a real KV cache while calibrating.
          if getattr(config, "n_inject", None):

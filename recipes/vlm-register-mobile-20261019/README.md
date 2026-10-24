@@ -22,6 +22,7 @@ out next to the RegSpec checkout.
 | 4 | `fixtures_m1.sh`, `fixtures_m2.sh`, `launch_m1_fixture.sh` | per-page vision fixtures for the device runs (`fixtures-m1/`) | the harness loads them with `QNN_VLM_LOAD` instead of running vision on the phone |
 | 5 | `export_target_a32_r1.sh` | a32r: a32 recalibrated with the dynreg8 register rows in every fixture | M6/M7 B protocol |
 | 6 | `export_target_a40_r1.sh`, `export_target_deep_a40.sh` (+ `export_mem_watchdog.sh`) | a40r and deep40 | M7 A protocol; the watchdog stops an export when the shared host's free memory runs low |
+| 6b | `export_target_a40_s1.sh` | a40s: the a40 graph calibrated in 32-row chunks (`--calib-ar 32`); its IO encodings are bit-identical to a32r | tests whether a32r and a40 differ through encodings or through the 40-row graph itself |
 | 7 | `rebuild_inject_dynreg8_norm8.sh`, `export_inject_dynreg8_norm8.sh` | inject-only 256-row draft-prefill graphs (`ctx-<arm>-inject256`) for dynreg8 and norm8 | none / norm32 / full / deep inject graphs came from the M4 queue (`scripts/queue_vlm_register_mobile_export.py`) |
 | - | `verify_restore_fixtures.sh` | - | checks fixtures restored from the phone after a server cleanup (count, size, sha256) |
 | - | `nothp.py` | - | runs a command with transparent huge pages disabled (an export once starved in kernel compaction) |

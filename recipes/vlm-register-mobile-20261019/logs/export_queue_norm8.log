@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 57, in <module>
+    main(sys.argv[1:] or ['none-20k-seed42', 'norm32-20k-seed42', 'dynreg8-20k-seed42', 'norm8-20k-seed42', 'deep-dynreg8-20k-seed42'])
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 32, in main
+    if not (asset/'manifest.json').exists(): run('convert', [PY, str(S/'prepare_vlm_register_mobile_export.py'), 'convert', '--arm', arm], OUT/f'{arm}-convert.log')
+                                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 24, in run
+    os.killpg(child.pid, signal.SIGTERM); child.wait(timeout=30); raise RuntimeError(f'{phase}: resource/time guard')
+                                                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: convert: resource/time guard

@@ -1,0 +1,12 @@
+10:29 START inject256 exports: dynreg8-20k-seed42 norm8-20k-seed42
+Traceback (most recent call last):
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 121, in <module>
+    main(argv or ['none-20k-seed42', 'norm32-20k-seed42', 'dynreg8-20k-seed42', 'norm8-20k-seed42', 'deep-dynreg8-20k-seed42'], context_len, limit, inject_rows)
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 10, in main
+    if inject_rows: return main_inject(arms, inject_rows, phase_limit_s)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 84, in main_inject
+    assert (OUT/'calibration/manifest.json').exists()
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError
+10:29 INJECT_EXPORT_FAILED

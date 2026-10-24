@@ -1,0 +1,27 @@
+W1021 21:46:42.600000 4084140 site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1021 21:46:42.646000 4084140 site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+/home/youngmin/anaconda3/envs/etqnn/lib/python3.11/site-packages/torchtune/__init__.py:18: UserWarning: The 'torch' module has already been imported. Setting PYTORCH_CUDA_ALLOC_CONF may not have an effect.For best results, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing 'torch'.
+  warnings.warn(
+[QNN] Using QNN SDK at /home/youngmin/qairt/2.37.1-v81 (from QNN_SDK_ROOT)
+[WARNING 2026-10-21 21:46:47,008 backend_opinfo_adapter.py:67] The backend_opinfo module couldn't be imported, so the abstract implementation will be used instead. This might be because $QNN_SDK_ROOT/lib/python isn't included in your PYTHONPATH, or the `BackendOpInfo` API isn't available in your QNN SDK version. Note that the `BackendOpInfo` API is supported starting from QNN SDK 2.41 and above.
+INJECT_CHECK {"id": "doc2-docvqa-07-628", "prefix": 3081, "packed_rows": 3081, "inject_calls": 13, "main_calls": 193, "cosine_min": 1.0001041889190674, "max_abs": 1.1444091796875e-05}
+INJECT_CHECK {"id": "doc20k-docvqa-06-156", "prefix": 1709, "packed_rows": 1709, "inject_calls": 7, "main_calls": 107, "cosine_min": 1.0000391006469727, "max_abs": 1.1444091796875e-05}
+INJECT_CHECK {"id": "doc20k-docvqa-09-719", "prefix": 3064, "packed_rows": 3064, "inject_calls": 12, "main_calls": 192, "cosine_min": 1.000105857849121, "max_abs": 1.1444091796875e-05}
+INJECT_CHECK {"id": "doc20k-docvqa-10-681", "prefix": 3015, "packed_rows": 3015, "inject_calls": 12, "main_calls": 189, "cosine_min": 1.0001002550125122, "max_abs": 9.5367431640625e-06}
+INJECT_CHECK {"id": "doc20k-docvqa-12-446", "prefix": 3072, "packed_rows": 3072, "inject_calls": 12, "main_calls": 192, "cosine_min": 1.0000956058502197, "max_abs": 1.049041748046875e-05}
+INJECT_CHECK {"id": "doc20k-docvqa-13-230", "prefix": 3018, "packed_rows": 3018, "inject_calls": 12, "main_calls": 189, "cosine_min": 1.0000865459442139, "max_abs": 1.1444091796875e-05}
+INJECT_CHECK {"id": "doc20k-chartqa-00-5902", "prefix": 523, "packed_rows": 523, "inject_calls": 3, "main_calls": 33, "cosine_min": 1.0000061988830566, "max_abs": 9.5367431640625e-06}
+INJECT_CHECK {"id": "doc20k-chartqa-00-8521", "prefix": 476, "packed_rows": 476, "inject_calls": 2, "main_calls": 30, "cosine_min": 1.0000070333480835, "max_abs": 9.5367431640625e-06}
+INJECT_CHECK {"id": "doc20k-chartqa-01-2197", "prefix": 476, "packed_rows": 476, "inject_calls": 2, "main_calls": 30, "cosine_min": 1.0000054836273193, "max_abs": 1.049041748046875e-05}
+INJECT_CHECK {"id": "doc20k-chartqa-01-405", "prefix": 1072, "packed_rows": 1072, "inject_calls": 5, "main_calls": 67, "cosine_min": 1.0000219345092773, "max_abs": 1.1444091796875e-05}
+INJECT_CHECK {"id": "doc20k-chartqa-01-6735", "prefix": 478, "packed_rows": 478, "inject_calls": 2, "main_calls": 30, "cosine_min": 1.0000052452087402, "max_abs": 9.5367431640625e-06}
+INJECT_CHECK {"id": "doc2-infographic-00-1915", "prefix": 983, "packed_rows": 983, "inject_calls": 4, "main_calls": 62, "cosine_min": 1.0000190734863281, "max_abs": 9.5367431640625e-06}
+INJECT_CHECK {"id": "doc2-infographic-00-1917", "prefix": 935, "packed_rows": 935, "inject_calls": 4, "main_calls": 59, "cosine_min": 1.0000170469284058, "max_abs": 1.33514404296875e-05}
+INJECT_CHECK {"id": "doc2-infographic-00-922", "prefix": 954, "packed_rows": 954, "inject_calls": 4, "main_calls": 60, "cosine_min": 1.0000141859054565, "max_abs": 9.5367431640625e-06}
+INJECT_CHECK {"id": "doc20k-infographic-00-1584", "prefix": 973, "packed_rows": 973, "inject_calls": 4, "main_calls": 61, "cosine_min": 1.0000160932540894, "max_abs": 1.33514404296875e-05}
+INJECT_CHECK {"id": "doc20k-infographic-00-397", "prefix": 794, "packed_rows": 794, "inject_calls": 4, "main_calls": 50, "cosine_min": 1.0000134706497192, "max_abs": 9.5367431640625e-06}
+INJECT_AUDIT {"arm": "full-20k-seed42", "passed": true, "cosine": 1.0, "max_abs": 1.33514404296875e-05}
+
+real	7m26.496s
+user	36m15.373s
+sys	4m51.420s

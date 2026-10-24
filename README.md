@@ -1,5 +1,11 @@
 # QNN_Exporter
 
+Qwen3-VL-4B targets for the existing Qwen3-4B DFlash drafter: see [the VLM export guide](docs/qwen3-vl-dflash.md)
+for the extension patch (`patch/apply_vlm.py`, `patch/qwen3-vl*.patch`), image calibration and the explicit
+MRoPE/DeepStack interface, and [recipes/vlm-register-mobile-20261019](recipes/vlm-register-mobile-20261019/README.md)
+for the exact launchers and logs of the Galaxy S26 register study (targets a32/a40/a32r/a40r/deep32/deep40,
+inject-only draft-prefill graphs, vision fixtures). Runtime changes live in MobiSpec.cpp.
+
 Build the Hexagon-NPU context binaries that
 [MobiSpec.cpp](https://github.com/mkjsym/MobiSpec.cpp) runs speculative decoding on: a Qwen3
 **target** and a DFlash/DSpark **draft**, both as QNN contexts, plus the `params.json` and the
@@ -158,6 +164,8 @@ on this device; AL does not move, and rank order is stable in both.
 | [docs/patch-notes.md](docs/patch-notes.md) | what the ExecuTorch patch changes, and what was deliberately left out |
 | [docs/quantization.md](docs/quantization.md) | why these recipes; every draft setting tried |
 | [docs/peak-memory.md](docs/peak-memory.md) | why an 8B export needs 127 GiB and how it got there from 154 |
+| [docs/qwen3-vl-dflash.md](docs/qwen3-vl-dflash.md) | Qwen3-VL-4B target export: extension patch, image calibration, MRoPE/DeepStack inputs |
+| [recipes/vlm-register-mobile-20261019/](recipes/vlm-register-mobile-20261019/README.md) | launchers and logs of every S26 register-study export (2026-10-19 .. 10-23) |
 
 ## Why these recipes
 

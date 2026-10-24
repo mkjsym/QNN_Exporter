@@ -1,0 +1,4 @@
+# doc2-chartqa-00-1886 image_tokens_host 425
+env QNN_VLM_DUMP=/home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/fixtures/doc2-chartqa-00-1886 QNN_VLM_EMBD=/home/youngmin/dev/llm/specinfer_QNN/experiments/vlm-dflash-20260913/target_embeddings.f16 /home/youngmin/dev/llm/MobiSpec.cpp/build-host-vlm/bin/llama-qnn-vlm-prepare -m /data/llamacpp_bench/models/Qwen3-VL-4B-Instruct-BF16.gguf --mmproj /data/llamacpp_bench/models/mmproj/mmproj-Qwen3VL-4B-F16.gguf --image /data/youngmin/datasets/document-vqa-20261015/images/chartqa/00000-1886.png --image-max-tokens 3072 -p 'Answer the following questions about this document. Give each answer as one complete sentence that includes the supporting detail from the document.
+1. How many causes that have over 5% share?
+2. What'"'"'s the no.1 cause in the chart?' -t 8

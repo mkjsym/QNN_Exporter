@@ -30,6 +30,8 @@ def main():
         from huggingface_hub import hf_hub_download
         cfg = json.load(open(hf_hub_download(a.hf, "config.json")))
 
+    root_model_type = cfg.get("model_type")
+    cfg = cfg.get("text_config", cfg)
     dim = cfg["hidden_size"]
     n_heads = cfg["num_attention_heads"]
     p = {
@@ -42,9 +44,11 @@ def main():
         "ffn_dim_multiplier": 1,
         "multiple_of": 256,
         "norm_eps": cfg.get("rms_norm_eps", 1e-6),
-        "rope_theta": cfg.get("rope_theta", 1000000.0),
+        "rope_theta": cfg.get("rope_parameters", {}).get("rope_theta", cfg.get("rope_theta", 1000000.0)),
         "use_scaled_rope": False,
     }
+    if root_model_type == "qwen3_vl" and not a.draft:
+        p.update(vlm_input_version=1, n_deepstack=3, mrope_sections=[24, 20, 20])
     if a.draft:
         p.update({
             "n_inject": a.n_inject,

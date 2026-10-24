@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 57, in <module>
+    main(sys.argv[1:] or ['none-20k-seed42', 'norm32-20k-seed42', 'dynreg8-20k-seed42', 'norm8-20k-seed42', 'deep-dynreg8-20k-seed42'])
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 34, in main
+    if not (asset/'fp32-audit.json').exists(): run('audit', [PY, str(S/'check_vlm_register_mobile_export.py'), '--arm', arm], OUT/f'{arm}-audit.log')
+                                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youngmin/dev/llm/QNN_Exporter/scripts/queue_vlm_register_mobile_export.py", line 26, in run
+    assert child.returncode == 0, f'{phase} failed; see {log}'
+           ^^^^^^^^^^^^^^^^^^^^^
+AssertionError: audit failed; see /home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/export/none-20k-seed42-audit.log

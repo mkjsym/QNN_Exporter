@@ -1,0 +1,18 @@
+10:37:30 calibration
+REGISTER_MOBILE_CALIBRATION 16
+10:37:35 convert dynreg8-20k-seed42
+W1023 10:37:41.642000 484018 site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1023 10:37:41.680000 484018 site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+REGISTER_MOBILE_CONVERTED dynreg8-20k-seed42
+CONVERT_IDENTICAL /home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/export-root/dynreg8-20k-seed42/manifest.json ['draft-meta.pth', 'embedding-f16.bin', 'registers-f32.bin']
+10:37:49 convert norm8-20k-seed42
+W1023 10:37:55.346000 484380 site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1023 10:37:55.377000 484380 site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+REGISTER_MOBILE_CONVERTED norm8-20k-seed42
+CONVERT_IDENTICAL /home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/export-root/norm8-20k-seed42/manifest.json ['draft-meta.pth', 'embedding-f16.bin', 'summary-f32.bin', 'summary.pt']
+10:38:05 inject256 queue
+REGISTER_MOBILE_INJECT_EXPORTED dynreg8-20k-seed42-inject256
+REGISTER_MOBILE_INJECT_EXPORTED norm8-20k-seed42-inject256
+COPIED ctx-dynreg8-20k-seed42-inject256
+COPIED ctx-norm8-20k-seed42-inject256
+10:43:58 INJECT_REBUILD_OK

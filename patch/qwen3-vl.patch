@@ -161,10 +161,10 @@ index ab42409..70b75ab 100644
      "qwen3-4b-lc": "qwen3",
 diff --git a/examples/qualcomm/oss_scripts/llama/inference/qwen3_vl.py b/examples/qualcomm/oss_scripts/llama/inference/qwen3_vl.py
 new file mode 100644
-index 0000000..493fc76
+index 0000000..e6d2e5c
 --- /dev/null
 +++ b/examples/qualcomm/oss_scripts/llama/inference/qwen3_vl.py
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,231 @@
 +"""Calibrate on actual mtmd image embeddings and DeepStack features.
 +
 +Each calibration sample replays one complete fixture, chunking exactly like the
@@ -214,8 +214,28 @@ index 0000000..493fc76
 +            if data.size == 0 or data.size % self.dim or not np.isfinite(data).all():
 +                raise ValueError(f"register table must be f32 [K, {self.dim}]: {registers}")
 +            self._registers = torch.from_numpy(data.reshape(-1, self.dim).copy())
-+        self._fixtures = []
-+        self._slot_index = []
++        self._fixtures, self._slot_index = self._load(fixtures, self._registers)
++        # D1b (2026-10-26, mobile plan 16.5): encoding import for the deep-register variant. QNN_VLM_CALIB_COMMON_REGISTERS names the
++        # register table the plain a32r target was calibrated with. Each calibration call then runs the fixture twice: a common pass
++        # on exactly a32r's rows (that table, every slot zero, so the deep graph computes the plain graph's values bit for bit) and a
++        # prompt pass on the deep rows above. Observer state is kept separately per pass; at the end every observer takes the common
++        # pass's state except the prompt path (slot input -> slot @ layer_prompts, up to the residual add), which takes the prompt
++        # pass's. The deep target then shares a32r's encodings everywhere outside the prompt path.
++        self._common = None
++        common = os.environ.get("QNN_VLM_CALIB_COMMON_REGISTERS")
++        if common:
++            if self._slot is None:
++                raise ValueError("QNN_VLM_CALIB_COMMON_REGISTERS applies to the deep-register variant only")
++            data = np.fromfile(common, dtype="<f4")
++            if data.size != self._registers.numel() or not np.isfinite(data).all():
++                raise ValueError(f"common register table must be f32 {tuple(self._registers.shape)}: {common}")
++            fixtures_c, slots_c = self._load(fixtures, torch.from_numpy(data.reshape(self._registers.shape).copy()))
++            self._common = dict(fixtures=fixtures_c, slot_index=[torch.full_like(s, -1) for s in slots_c], state=None, prompt_state=None,
++                                fresh=None, prompt_path=None, calls=0)
++        self._cursor = 0
++
++    def _load(self, fixtures, registers):
++        loaded, slot_indices = [], []
 +        for name in fixtures:
 +            path = Path(name)
 +            meta = json.loads(path.read_text())
@@ -230,25 +250,25 @@ index 0000000..493fc76
 +                    raise ValueError(f"malformed fixture tensor: {prefix}.{role}")
 +                values.append(torch.from_numpy(data.reshape(meta["rows"], dim)))
 +            slot_index = torch.full((meta["rows"],), -1, dtype=torch.long)
-+            if self._registers is not None:
++            if registers is not None:
 +                positions = np.fromfile(str(prefix) + ".positions.i32", dtype="<i4")
 +                if positions.size != meta["rows"] * 3:
 +                    raise ValueError(f"malformed fixture positions: {prefix}")
 +                last = int(positions.reshape(meta["rows"], 3)[-1].max())
-+                k = self._registers.shape[0]
++                k = registers.shape[0]
 +                q = torch.arange(last + 1, last + 1 + k, dtype=torch.float64)[:, None]
 +                inv = 5e6 ** (-torch.arange(0, meta["head_dim"], 2, dtype=torch.float64) / meta["head_dim"])   # Qwen3-VL text rows: all MRoPE axes equal
 +                check_q = torch.tensor([float(last)])[:, None]
 +                if (torch.cos(check_q * inv).float() - values[1][-1]).abs().max() > 1e-3:
 +                    raise ValueError(f"RoPE synthesis does not reproduce the fixture's last row: {prefix}")
-+                extra = [self._registers, torch.cos(q * inv).float(), torch.sin(q * inv).float()] + [torch.zeros(k, self.dim)] * 3
++                extra = [registers, torch.cos(q * inv).float(), torch.sin(q * inv).float()] + [torch.zeros(k, self.dim)] * 3
 +                values = [torch.cat((v, e), 0) for v, e in zip(values, extra)]
 +                slot_index = torch.cat((slot_index, torch.arange(k)))
 +            if values[0].shape[0] > self._k[0].shape[-1]:
 +                raise ValueError("fixture exceeds this graph's persistent KV capacity")
-+            self._fixtures.append(values)
-+            self._slot_index.append(slot_index)
-+        self._cursor = 0
++            loaded.append(values)
++            slot_indices.append(slot_index)
++        return loaded, slot_indices
 +
 +    def _inputs(self, fixture, offset, keys, values, slot_index=None):
 +        n = min(self.ar_len, fixture[0].shape[0] - offset)
@@ -278,6 +298,11 @@ index 0000000..493fc76
 +            fixture = self._fixtures[self._cursor % len(self._fixtures)]
 +            slot_index = self._slot_index[self._cursor % len(self._fixtures)]
 +            self._cursor += 1
++            return self._replay(model, fixture, slot_index)
++        return forward
++
++    def _replay(self, model, fixture, slot_index):
++        if True:
 +            keys, values = [torch.zeros_like(k) for k in self._k], [torch.zeros_like(v) for v in self._v]
 +            logits = []
 +            for offset in range(0, fixture[0].shape[0], self.ar_len):
@@ -294,12 +319,83 @@ index 0000000..493fc76
 +                    keys[i][..., offset:offset + n] = flat[i][..., :n].detach()
 +                    values[i][..., offset:offset + n, :] = flat[half + i][..., :n, :].detach()
 +            return torch.cat(logits, dim=1)
-+        return forward
++
++    @staticmethod
++    def _observers(module):
++        # pt2e names every inserted observer activation_post_process_<n>; the classes come from torchao here, not torch.ao, so match by name
++        return {name: m for name, m in module.named_modules() if name.startswith("activation_post_process_")}
++
++    @staticmethod
++    def _snapshot(observers):
++        return {name: {b: t.detach().clone() for b, t in m._buffers.items() if t is not None} for name, m in observers.items()}
++
++    @staticmethod
++    def _restore(observers, state, names=None):
++        for name in (observers if names is None else names):
++            for b, t in state[name].items():
++                observers[name]._buffers[b] = t.detach().clone()
++
++    @staticmethod
++    def _prompt_path(module, observers):
++        """Observer modules on the path from the vlm_prompt_slot input up to (not including) the residual add, plus the observers of
++        the other operands of every op on that path (the baked layer-prompt constants)."""
++        graph = module.graph
++        slot = [n for n in graph.nodes if n.op == "placeholder" and "prompt_slot" in n.name]
++        if len(slot) != 1:
++            raise ValueError(f"expected one vlm_prompt_slot placeholder, found {[n.name for n in slot]}")
++        adds = {torch.ops.aten.add.Tensor, torch.ops.aten.add_.Tensor, torch.add, torch.Tensor.add}
++        found, seen, stack, ops = set(), set(), [slot[0]], 0
++        while stack:
++            node = stack.pop()
++            if node in seen:
++                continue
++            seen.add(node)
++            for user in node.users:
++                if user.op == "call_module" and user.target in observers:
++                    found.add(user.target); stack.append(user)
++                elif user.op == "call_function" and user.target in adds:
++                    continue   # the residual add: its output is a common tensor
++                else:
++                    ops += 1; stack.append(user)
++                    for arg in user.all_input_nodes:
++                        if arg.op == "call_module" and arg.target in observers and arg not in seen:
++                            found.add(arg.target)
++        if not found:
++            mods = [n for n in graph.nodes if n.op == "call_module"]
++            print(f"[D1b] diagnostic: {len(mods)} call_module nodes, {len(observers)} observer modules, sample {list(observers)[:3]}, "
++                  f"call_module targets {[n.target for n in mods[:3]]}", flush=True)
++            frontier, depth = [slot[0]], 0
++            while frontier and depth < 6:
++                nxt = []
++                for node in frontier:
++                    for user in node.users:
++                        print(f"[D1b]  depth {depth} {node.name} -> {user.name} op={user.op} target={user.target} args={[str(x) for x in user.args][:4]}", flush=True)
++                        if len(nxt) < 12: nxt.append(user)
++                frontier, depth = nxt, depth + 1
++            raise ValueError("no observer on the prompt path; the deep graph layout is not what the encoding import expects")
++        return sorted(found), ops
 +
 +    @torch.no_grad()
 +    def predict_step(self, module, input_ids, attn_mask=None, hidden_states=(), tok_embedding=None):
 +        # PTQStrategy calls predict_step, so replay the complete image prefix here too.
-+        return self.make_forward_fn()(module, {"input_ids": input_ids})
++        if self._common is None:
++            return self.make_forward_fn()(module, {"input_ids": input_ids})
++        c = self._common; observers = self._observers(module)
++        if c["fresh"] is None:
++            c["fresh"] = self._snapshot(observers)
++            c["prompt_path"], ops = self._prompt_path(module, observers)
++            print(f"[D1b] encoding import: {len(observers)} observers, {len(c['prompt_path'])} on the prompt path ({ops} ops)", flush=True)
++        index = self._cursor % len(self._fixtures); self._cursor += 1
++        self._restore(observers, c["state"] or c["fresh"])                      # common pass: exactly a32r's rows, zero slots
++        self._replay(module, c["fixtures"][index], c["slot_index"][index])
++        c["state"] = self._snapshot(observers)
++        self._restore(observers, c["prompt_state"] or c["fresh"])               # prompt pass: deep rows, one-hot slots
++        out = self._replay(module, self._fixtures[index], self._slot_index[index])
++        c["prompt_state"] = self._snapshot(observers)
++        self._restore(observers, c["state"])                                     # leave the merged state in the observers
++        self._restore(observers, c["prompt_state"], c["prompt_path"])
++        c["calls"] += 1
++        return out
 diff --git a/examples/qualcomm/oss_scripts/llama/llama.py b/examples/qualcomm/oss_scripts/llama/llama.py
 index d309547..910791c 100755
 --- a/examples/qualcomm/oss_scripts/llama/llama.py

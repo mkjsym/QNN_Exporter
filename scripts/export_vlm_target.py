@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--method", choices=("dflash", "eagle3", "dflash-deep"), default="dflash")
     parser.add_argument("--layer-prompts", type=Path, default=None, help="dflash-deep: f32 [33, 8, dim] per-layer register prompts baked into the graph")
     parser.add_argument("--calib-registers", type=Path, default=None, help="f32 [8, dim] register table appended to every calibration fixture: dflash-deep with one-hot prompt slots; dflash (plain) without slots, so the plain target's PTQ encodings see the dynamic-register side rows it serves on the device (M6, 2026-10-22)")
+    parser.add_argument("--calib-common-registers", type=Path, default=None, help="dflash-deep only (D1b, 2026-10-26): the register table the plain target was calibrated with. Every calibration fixture is replayed twice, once on the plain target's exact rows with zero slots and once on the deep rows, and every observer outside the prompt path keeps the first pass's state, so the deep target shares the plain target's encodings")
     parser.add_argument("--kv-bits", type=int, choices=(8,16), default=8)
     parser.add_argument("--calib-ar", type=int, default=None, help="rows per PTQ calibration step (default: --ar). Calibrating a 40-row target at 32 gives it the encodings of the 32-row target built from the same fixtures (shared encodings across verification widths)")
     parser.add_argument("--context-only", action="store_true", help="save native contexts without a duplicate PTE container")
@@ -45,6 +46,12 @@ def main():
         if args.calib_registers is None or not args.calib_registers.is_file() or args.calib_registers.stat().st_size != 8 * 2560 * 4:
             parser.error("--calib-registers must be the arm's [8, 2560] float32 register table (deep calibration needs real register rows)")
         os.environ["QNN_VLM_CALIB_REGISTERS"] = str(args.calib_registers.resolve())
+        if args.calib_common_registers is not None:
+            if not args.calib_common_registers.is_file() or args.calib_common_registers.stat().st_size != 8 * 2560 * 4:
+                parser.error("--calib-common-registers must be the plain target's [8, 2560] float32 register table")
+            os.environ["QNN_VLM_CALIB_COMMON_REGISTERS"] = str(args.calib_common_registers.resolve())
+    elif args.calib_common_registers is not None:
+        parser.error("--calib-common-registers goes with --method dflash-deep")
     elif args.calib_registers is not None:
         # plain dflash target calibrated with the dynamic-register rows of a dynreg arm (M6 re-calibration, 2026-10-22)
         if not args.calib_registers.is_file() or args.calib_registers.stat().st_size != 8 * 2560 * 4:
@@ -98,6 +105,7 @@ def main():
         "draft": "unchanged Qwen3-4B " + args.method, "calibration_fixtures": len(args.fixture),
         "layer_prompts": str(args.layer_prompts.resolve()) if args.layer_prompts else None,
         "calib_registers": str(args.calib_registers.resolve()) if args.calib_registers else None,
+        "calib_common_registers": str(args.calib_common_registers.resolve()) if args.calib_common_registers else None,
         "kv_bits": args.kv_bits, "context_only": args.context_only, "calib_ar": args.calib_ar or args.ar}, indent=2) + "\n")
     params = json.loads((et / "examples/models/qwen3/config/vl_4b_config.json").read_text())
     params.update(vlm_input_version=1, n_deepstack=3, mrope_sections=[24,20,20])

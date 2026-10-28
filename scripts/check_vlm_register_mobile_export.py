@@ -19,6 +19,9 @@ def main():
     graph = DFlashDraftModel(config, ar_len=8, n_inject=16, n_target_layers=5).eval(); extend_rope_tables(graph, config)
     graph.load_state_dict(torch.load(asset/'draft-meta.pth', weights_only=True, mmap=True), strict=True, assign=True)
     refs = json.loads((asset/'native-references.json').read_text()); checks = []
+    # HiViS port (mobile plan 19): the runtime adds the per-offset residual to block rows 0..6 (DFLASH_VLM_BLOCK_RESIDUAL); the host reference
+    # (NoneResDraft._forward_backbone) adds it inside the model, so the graph is fed the same sum here
+    residual = torch.from_numpy(__import__('numpy').fromfile(asset/'block-residual-f32.bin', dtype='<f4')).view(7, 2560) if (asset/'block-residual-f32.bin').exists() else None
     for record in refs['records']:
         assert sha(record['path']) == record['sha256']; item = torch.load(record['path'], weights_only=True)
         features = item['context'].reshape(-1, 5, 2560); positions = item['context_positions']; prefix = len(features)
@@ -32,7 +35,9 @@ def main():
             mask = torch.full((1, 1, 8, L), -255.); mask[..., :begin] = 0; mask[..., cache:cache+take] = 0; mask[..., -8:-1] = 0
             ctx_pos = torch.zeros((1, 16), dtype=torch.int32); ctx_pos[0, :take] = positions[begin:end].int()
             block_pos = torch.arange(item['original_prefix'], item['original_prefix']+8, dtype=torch.int32)[None]
-            result, new_keys, new_values = graph(*hidden, graph.tok_embeddings(block), mask, block_pos, ctx_pos, *keys, *values)
+            embeddings = graph.tok_embeddings(block)
+            if residual is not None: embeddings = embeddings.clone(); embeddings[0, :7] += residual
+            result, new_keys, new_values = graph(*hidden, embeddings, mask, block_pos, ctx_pos, *keys, *values)
             for layer in range(5):
                 keys[layer][..., begin:end] = new_keys[layer][..., :take]; values[layer][:, :, begin:end, :] = new_values[layer][:, :, :take, :]
         actual = result[:, :7]; reference = item['reference_logits']; diff = (actual-reference).abs(); equal = actual.argmax(-1).equal(reference.argmax(-1))

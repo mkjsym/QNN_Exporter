@@ -16,7 +16,10 @@ OUT = Path(os.environ.get('REGISTER_MOBILE_EXPORT_OUT') or ROOT/'artifacts/vlm-r
 TEXT = ROOT.parent/'dflash-models/Qwen3-4B'
 ARMS = {'none-20k-seed42': dict(mode='none'), 'norm8-20k-seed42': dict(mode='norm8', regions=(2, 4)), 'norm32-20k-seed42': dict(mode='norm32', regions=(4, 8)),
         'dynreg8-20k-seed42': dict(mode='dynreg', register_count=8), 'deep-dynreg8-20k-seed42': dict(mode='dynreg', register_count=8, deep=True),
-        'full-20k-seed42': dict(mode='full')}   # GLANCE-style: every prompt row, image rows included (M3, 2026-10-21; needs the 4,096-row drafter graph)
+        'full-20k-seed42': dict(mode='full'),   # GLANCE-style: every prompt row, image rows included (M3, 2026-10-21; needs the 4,096-row drafter graph)
+        # Mobile plan 19 (D1, 2026-10-28): faithful published baselines on the none graph; their image handling is CPU-side in the runtime
+        # (vlm-image-summary.h kind vispec; DFLASH_VLM_BLOCK_RESIDUAL), so the graph audits pack them like none (see pack()).
+        'vispec1-20k-seed42': dict(mode='vispec1'), 'none-res7-20k-seed42': dict(mode='none-res')}
 # Drafter graph context: 1,024 for the M2 arms (cache 1,000 rows), 4,096 for the M3 Full arm and its iso-graph none control (cache 4,072).
 # The cache is the context minus the 16 inject rows and the 8 block rows; artifacts of a non-default context carry the suffix -c<L>.
 BLOCK_ROWS, INJECT_ROWS = 8, 16
@@ -67,7 +70,9 @@ def pack(sample, mode, assets, arm_spec):
     visual = torch.zeros(total, dtype=torch.bool); visual[image] = True
     if mode == 'full':
         return features, pos   # every row of the prompt in sequence order (the host OnlineFullDraft and the device's summary=full path)
-    if mode == 'none':
+    if mode in ('none', 'vispec1', 'none-res'):
+        # vispec1 / none-res: the drafter graph is the none graph; the ViSpec rows and global vector (runtime prepare_vispec) and the HiViS
+        # block residual (added to the block embeddings) are checked by MobiSpec.cpp tools/research/check_vlm_faithful_runtime.py and the audit
         keep = ~visual
         return features[keep], pos[keep]
     if mode == 'dynreg':

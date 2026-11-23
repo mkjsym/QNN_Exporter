@@ -1,0 +1,29 @@
+{
+  "checked_at": "2026-11-10T07:26:14.666059+09:00",
+  "source": "original six-thread target exports",
+  "shared_io_tensors": 354,
+  "scale_different_tensors": 246,
+  "other_quantization_fields_changed": 0,
+  "max_relative_scale_difference": 4.96e-06,
+  "steering_vs_checkpoint_shared_io_identical": 364,
+  "ar_probe_case": "doc2-infographic-00-1024",
+  "ar_lengths": {
+    "a32r": 38,
+    "steering40": 40,
+    "copy56": 40
+  },
+  "ar_steering_equals_checkpoint": true,
+  "ar_common_prefix_with_baseline": 26,
+  "hypothesis": "Eight-thread baseline vs six-thread new PTQ changed floating point reductions; confirmation pending t8 export",
+  "repair": "Only Steering40 and Checkpoint56 re-exported with OMP_NUM_THREADS=MKL_NUM_THREADS=8; keep strict gates",
+  "primary_measurements_complete": 0,
+  "steering_t8_repair": {
+    "passed": true,
+    "shared_io_identical": 354,
+    "max_relative_scale_difference": 0,
+    "completed_local": "2026-11-10T09:43:23+09:00",
+    "device_ar_and_sd_smoke_passed": true,
+    "matched_output_tokens": 38
+  },
+  "checkpoint_t8_repair": "running"
+}

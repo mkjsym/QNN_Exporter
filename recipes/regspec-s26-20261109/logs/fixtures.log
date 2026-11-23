@@ -1,0 +1,16 @@
+FIXTURE doc2-infographic-00-1024 1156
+FIXTURE doc2-docvqa-00-293 3038
+FIXTURE doc2-docvqa-05-342 3024
+FIXTURE doc2-infographic-00-220 368
+FIXTURE doc2-chartqa-01-3101 425
+FIXTURE bench-sqa-img-000 30
+FIXTURE bench-sqa-img-001 299
+FIXTURE ho-textvqa-val-000 672
+FIXTURE ho-textvqa-val-001 864
+FIXTURE ho-ai2d-test-000 475
+FIXTURE ho-ai2d-test-001 940
+FIXTURE ho-coco-cap-000 300
+FIXTURE ho-coco-cap-001 192
+FIXTURE nat2-aokvqa-val-0000 300
+FIXTURE nat2-aokvqa-val-0001 260
+REGSPEC_INPUTS_COMPLETE 15

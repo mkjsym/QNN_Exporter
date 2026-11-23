@@ -1,0 +1,17 @@
+shard 0: tensors 30/32, common 30, identical 30, max relative scale difference 0.00e+00, only in A 0, only in B 2
+  only in B: (0, 'in', 'vlm_prompt_slot@0')
+  only in B: (1, 'in', 'vlm_prompt_slot@0')
+shard 1: tensors 76/78, common 76, identical 76, max relative scale difference 0.00e+00, only in A 0, only in B 2
+  only in B: (0, 'in', 'vlm_prompt_slot@0')
+  only in B: (1, 'in', 'vlm_prompt_slot@0')
+shard 2: tensors 74/76, common 74, identical 74, max relative scale difference 0.00e+00, only in A 0, only in B 2
+  only in B: (0, 'in', 'vlm_prompt_slot@0')
+  only in B: (1, 'in', 'vlm_prompt_slot@0')
+shard 3: tensors 74/76, common 74, identical 74, max relative scale difference 0.00e+00, only in A 0, only in B 2
+  only in B: (0, 'in', 'vlm_prompt_slot@0')
+  only in B: (1, 'in', 'vlm_prompt_slot@0')
+shard 4: tensors 74/76, common 74, identical 74, max relative scale difference 0.00e+00, only in A 0, only in B 2
+  only in B: (0, 'in', 'vlm_prompt_slot@0')
+  only in B: (1, 'in', 'vlm_prompt_slot@0')
+shard 5: tensors 26/26, common 26, identical 26, max relative scale difference 0.00e+00, only in A 0, only in B 0
+ENCODINGS_IDENTICAL

@@ -27,7 +27,9 @@ def convert(arm):
     assert shutil.disk_usage(OUT).free > 50*(1 << 30)
     spec = ARMS[arm]; target = OUT/arm; target.mkdir(parents=True, exist_ok=False)
     complete = json.loads((STUDY/arm/'complete.json').read_text())
-    cp = Path(complete['checkpoint'])/'model.safetensors'; assert sha(cp) == complete['model_sha256']
+    cp = STUDY/arm/'model.safetensors'
+    if not cp.exists(): cp = Path(complete['checkpoint'])/'model.safetensors'
+    assert sha(cp) == complete['model_sha256']
     state = load_file(str(cp)); state.pop('visual_queries', None)
     side = {}
     if spec['mode'] in ('norm8', 'norm32'):

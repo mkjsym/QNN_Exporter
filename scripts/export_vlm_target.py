@@ -106,7 +106,8 @@ def main():
         "layer_prompts": str(args.layer_prompts.resolve()) if args.layer_prompts else None,
         "calib_registers": str(args.calib_registers.resolve()) if args.calib_registers else None,
         "calib_common_registers": str(args.calib_common_registers.resolve()) if args.calib_common_registers else None,
-        "kv_bits": args.kv_bits, "context_only": args.context_only, "calib_ar": args.calib_ar or args.ar}, indent=2) + "\n")
+        "kv_bits": args.kv_bits, "context_only": args.context_only, "calib_ar": args.calib_ar or args.ar,
+        "calibration_threads": {k: env.get(k) for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")}}, indent=2) + "\n")
     params = json.loads((et / "examples/models/qwen3/config/vl_4b_config.json").read_text())
     params.update(vlm_input_version=1, n_deepstack=3, mrope_sections=[24,20,20])
     params.update(speculative_method=args.method,

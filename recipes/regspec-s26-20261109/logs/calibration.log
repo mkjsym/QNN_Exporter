@@ -1,0 +1,18 @@
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights:  40%|███▉      | 282/713 [00:00<00:00, 2818.55it/s]Loading weights:  86%|████████▋ | 616/713 [00:00<00:00, 3121.12it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 3221.76it/s]
+REGSPEC_CALIB doc2-docvqa-07-628
+REGSPEC_CALIB doc20k-docvqa-06-156
+REGSPEC_CALIB doc20k-docvqa-09-719
+REGSPEC_CALIB doc20k-docvqa-10-681
+REGSPEC_CALIB doc20k-docvqa-12-446
+REGSPEC_CALIB doc20k-docvqa-13-230
+REGSPEC_CALIB doc20k-chartqa-00-5902
+REGSPEC_CALIB doc20k-chartqa-00-8521
+REGSPEC_CALIB doc20k-chartqa-01-2197
+REGSPEC_CALIB doc20k-chartqa-01-405
+REGSPEC_CALIB doc20k-chartqa-01-6735
+REGSPEC_CALIB doc2-infographic-00-1915
+REGSPEC_CALIB doc2-infographic-00-1917
+REGSPEC_CALIB doc2-infographic-00-922
+REGSPEC_CALIB doc20k-infographic-00-1584
+REGSPEC_CALIB doc20k-infographic-00-397
+REGSPEC_CALIBRATION_COMPLETE

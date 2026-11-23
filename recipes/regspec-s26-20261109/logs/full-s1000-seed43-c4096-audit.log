@@ -1,0 +1,12 @@
+W1109 22:28:17.225000 2810856 site-packages/torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W1109 22:28:17.277000 2810856 site-packages/torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+/home/youngmin/anaconda3/envs/etqnn/lib/python3.11/site-packages/torchtune/__init__.py:18: UserWarning: The 'torch' module has already been imported. Setting PYTORCH_CUDA_ALLOC_CONF may not have an effect.For best results, set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before importing 'torch'.
+  warnings.warn(
+[QNN] Using QNN SDK at /home/youngmin/qairt/2.37.1-v81 (from QNN_SDK_ROOT)
+[WARNING 2026-11-09 22:28:21,764 backend_opinfo_adapter.py:67] The backend_opinfo module couldn't be imported, so the abstract implementation will be used instead. This might be because $QNN_SDK_ROOT/lib/python isn't included in your PYTHONPATH, or the `BackendOpInfo` API isn't available in your QNN SDK version. Note that the `BackendOpInfo` API is supported starting from QNN SDK 2.41 and above.
+CHECK {'id': 'doc2-docvqa-07-628', 'prefix': 3081, 'packed_rows': 3081, 'max_abs': 0.00045680999755859375, 'top1_exact': True}
+CHECK {'id': 'doc2-docvqa-07-628', 'prefix': 3097, 'packed_rows': 3097, 'max_abs': 1.5676021575927734e-05, 'top1_exact': True}
+CHECK {'id': 'doc20k-chartqa-00-5902', 'prefix': 523, 'packed_rows': 523, 'max_abs': 2.956390380859375e-05, 'top1_exact': True}
+CHECK {'id': 'doc20k-chartqa-00-5902', 'prefix': 539, 'packed_rows': 539, 'max_abs': 1.52587890625e-05, 'top1_exact': True}
+CHECK {'id': 'doc2-infographic-00-1915', 'prefix': 983, 'packed_rows': 983, 'max_abs': 1.33514404296875e-05, 'top1_exact': True}
+CHECK {'id': 'doc2-infographic-00-1915', 'prefix': 999, 'packed_rows': 999, 'max_abs': 1.71661376953125e-05, 'top1_exact': True}

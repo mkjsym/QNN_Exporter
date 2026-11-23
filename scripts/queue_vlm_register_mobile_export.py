@@ -50,7 +50,7 @@ def main(arms, context_len=1024, phase_limit_s=5400, inject_rows=0):
             write(context/'runtime-contract.json', dict(arm=arm, mode=manifest['mode'], open_block=7, output_rows=list(range(7)), target_ar_len=32, inject_rows=16,
                                                        max_context_len=context_len, cache_rows=cache_rows(context_len),
                                                        checkpoint_sha256=manifest['checkpoint_sha256'], context_sha256=sha(context/'forward_0.bin'), params_sha256=sha(context/'params.json'),
-                                                       side_files={n: sha(asset/n) for n in ('summary-f32.bin', 'registers-f32.bin', 'layer-prompts-f32.bin') if (asset/n).exists()}))
+                                                       side_files={n: sha(asset/n) for n in ('summary-f32.bin', 'registers-f32.bin', 'layer-prompts-f32.bin', 'vispec-adaptor.bin', 'block-residual-f32.bin') if (asset/n).exists()}))
             print('REGISTER_MOBILE_EXPORTED', arm+sfx, flush=True)
         state.update(status='complete')
     except BaseException as e:

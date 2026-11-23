@@ -27,13 +27,23 @@ def convert(arm):
     assert shutil.disk_usage(OUT).free > 50*(1 << 30)
     spec = ARMS[arm]; target = OUT/arm; target.mkdir(parents=True, exist_ok=False)
     complete = json.loads((STUDY/arm/'complete.json').read_text())
-    cp = Path(complete['checkpoint'])/'model.safetensors'; assert sha(cp) == complete['model_sha256']
+    cp = STUDY/arm/'model.safetensors'
+    if not cp.exists(): cp = Path(complete['checkpoint'])/'model.safetensors'
+    assert sha(cp) == complete['model_sha256']
     state = load_file(str(cp)); state.pop('visual_queries', None)
     side = {}
     if spec['mode'] in ('norm8', 'norm32'):
         side['summary.pt'] = {k: state.pop(k).float() for k in ('summary_key.weight', 'summary_condition.weight', 'summary_queries')}
         torch.save(side['summary.pt'], target/'summary.pt')
         torch.cat([side['summary.pt'][k].flatten() for k in ('summary_key.weight', 'summary_condition.weight', 'summary_queries')]).numpy().tofile(target/'summary-f32.bin')
+    if spec['mode'] in ('vispec1', 'none-res'):   # mobile plan 19: device side files in the runtime's layout (MobiSpec.cpp tools/training/vlm_faithful_side_files.py)
+        sys.path.insert(0, str(MOBI/'tools/training'))
+        from vlm_faithful_side_files import write_vispec_adaptor, write_block_residual
+        if spec['mode'] == 'vispec1':
+            keys = ('summary_adaptor_q', 'summary_adaptor_k.weight', 'summary_adaptor_v.weight', 'summary_adaptor_o.weight', 'summary_global.weight')
+            write_vispec_adaptor({k: state.pop(k) for k in keys}, target/'vispec-adaptor.bin')
+        else:
+            write_block_residual({'offset_residual': state.pop('offset_residual')}, target/'block-residual-f32.bin')
     if spec['mode'] == 'dynreg':
         regs = state.pop('register_embeddings').float(); regs.numpy().tofile(target/'registers-f32.bin')
         if 'register_layer_prompts' in state: state.pop('register_layer_prompts').float().numpy().tofile(target/'layer-prompts-f32.bin')
@@ -49,7 +59,7 @@ def convert(arm):
     converted = dflash_hf_to_meta(weights)
     assert torch.equal(torch.cat([converted[f'fc.{i}.weight'] for i in range(5)], 1), weights['fc.weight'])
     torch.save(converted, target/'draft-meta.pth'); embedding.half().numpy().tofile(target/'embedding-f16.bin')
-    names = ['draft-meta.pth', 'embedding-f16.bin'] + [n for n in ('summary.pt', 'summary-f32.bin', 'registers-f32.bin', 'layer-prompts-f32.bin') if (target/n).exists()]
+    names = ['draft-meta.pth', 'embedding-f16.bin'] + [n for n in ('summary.pt', 'summary-f32.bin', 'registers-f32.bin', 'layer-prompts-f32.bin', 'vispec-adaptor.bin', 'block-residual-f32.bin') if (target/n).exists()]
     write(target/'manifest.json', dict(arm=arm, mode=spec['mode'], spec={k: (list(v) if isinstance(v, tuple) else v) for k, v in spec.items()}, step=complete['step'],
                                        checkpoint=str(cp), checkpoint_sha256=complete['model_sha256'], source_sha256=sha(__file__),
                                        converter_sha256=sha(et/'examples/models/qwen3_dflash/convert_weights.py'),

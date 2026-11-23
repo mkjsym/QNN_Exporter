@@ -1,0 +1,13 @@
+12:54 D1_EXPORT_START MemAvailable 162 GiB
+2.9G	/home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/target-a40-c4096-s1
+520K	/home/youngmin/dev/llm/QNN_Exporter/artifacts/vlm-register-mobile-20261019/ctx_vlm_a40_c4096_s1
+A40S_TARGET_DONE
+14:19 D1_EXPORT_DONE
+shard 0: tensors 15/15, common 15, identical 15, max relative scale difference 0.00e+00
+shard 1: tensors 38/38, common 38, identical 38, max relative scale difference 0.00e+00
+shard 2: tensors 37/37, common 37, identical 37, max relative scale difference 0.00e+00
+shard 3: tensors 37/37, common 37, identical 37, max relative scale difference 0.00e+00
+shard 4: tensors 37/37, common 37, identical 37, max relative scale difference 0.00e+00
+shard 5: tensors 13/13, common 13, identical 13, max relative scale difference 0.00e+00
+ENCODINGS_IDENTICAL
+D1_JUDGE1_PASS
